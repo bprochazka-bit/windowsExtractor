@@ -112,6 +112,61 @@ def test_extract_clamps_out_of_bounds_rect():
     assert bgra.shape[2] == 4
 
 
+# --- corner-radius estimation -----------------------------------------------
+
+def _rounded_region(rect, radius, shape=(800, 1280)):
+    """A full-image mask that is a rounded rectangle at ``rect``."""
+    x, y, w, h = rect
+    mask = np.zeros(shape, np.uint8)
+    sub = detector._rounded_rect_alpha(h, w, radius)
+    mask[y : y + h, x : x + w] = sub
+    return mask
+
+
+def test_estimate_corner_radius_matches_known_radius():
+    rect = (200, 150, 500, 360)
+    for radius in (0, 10, 20, 35):
+        region = _rounded_region(rect, radius)
+        est = detector.estimate_corner_radius(region, rect)
+        if radius == 0:
+            assert est == 0, est
+        else:
+            # Diagonal probing on a rasterised arc is within a few px.
+            assert abs(est - radius) <= 4, (radius, est)
+
+
+def test_estimate_corner_radius_median_ignores_one_bad_corner():
+    rect = (200, 150, 500, 360)
+    region = _rounded_region(rect, 20)
+    # Wreck one corner: punch a background hole along its diagonal so that
+    # corner reads as a huge radius. The median of the other three should win.
+    x, y, w, h = rect
+    cv2.rectangle(region, (x, y), (x + 120, y + 120), 0, -1)
+    est = detector.estimate_corner_radius(region, rect)
+    assert abs(est - 20) <= 6, est
+
+
+def test_detect_reports_rounded_corner_radius():
+    # Desktop background with a rounded-corner window composited on top.
+    h, w = 800, 1280
+    img = np.full((h, w, 3), 50, np.uint8)
+    img[:, :, 2] = 90
+    x, y, ww, wh, r = 300, 200, 640, 420, 22
+    alpha = detector._rounded_rect_alpha(wh, ww, r)
+    window = np.full((wh, ww, 3), 235, np.uint8)
+    window[:36] = (200, 120, 60)  # title bar
+    roi = img[y : y + wh, x : x + ww]
+    m = (alpha > 0)[:, :, None]
+    img[y : y + wh, x : x + ww] = np.where(m, window, roi)
+
+    result = detector.detect_window_at(img, (x + ww // 2, y + wh // 2))
+    assert result is not None
+    assert abs(result.corner_radius - r) <= 6, result.corner_radius
+    # And the rectangle is still the whole window.
+    rx, ry, rw, rh = result.rect
+    assert abs(rw - ww) <= 12 and abs(rh - wh) <= 12
+
+
 if __name__ == "__main__":
     import traceback
 

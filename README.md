@@ -20,8 +20,28 @@ one window, or to isolate a window from a busy desktop background.
    is transparent.
 
 The menu (☰) has a **detection sensitivity** slider (how large a region the
-detector will accept), a **rounded corners** option for modern window
-decorations, and zoom controls (also `Ctrl` + scroll wheel).
+detector will accept), a **corner radius** control, and zoom controls (also
+`Ctrl` + scroll wheel).
+
+### How detection works
+
+A window is modelled as a **rectangle + a single corner radius** — the two
+things that fully describe a modern window decoration:
+
+1. **Rectangle.** Edge detection (dual-threshold Canny → dilate/close →
+   contours) yields candidate boxes; the largest one containing your click,
+   below a full-image guard, is taken as the window's width/height. Robust,
+   because a window's straight edges are its strongest lines.
+2. **Corner radius.** From each of the four corners we walk inward along the
+   45° diagonal until we cross into window pixels. For a quarter-circle of
+   radius `r`, the arc meets that diagonal at a per-axis offset of
+   `r·(1 − 1/√2)`, so each corner gives `r ≈ 3.414 × offset`. The four
+   estimates are reduced with a **median** (so one corner spoiled by a shadow
+   or a widget can't skew it) and applied **symmetrically** to all corners.
+
+The measured radius pre-fills the **corner radius** control, where you can
+still adjust it. The cutout is then a clean rounded rectangle — no jagged
+contour tracing.
 
 ## Install (Debian / Ubuntu, GNOME)
 

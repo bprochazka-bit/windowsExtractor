@@ -50,9 +50,9 @@ class ImageCanvas(Gtk.DrawingArea):
         self.sensitivity = 0.01  # min_area_frac for detection
         self.corner_radius = 0
 
-        # Selection state (image pixel coords) and optional detected contour.
+        # Selection state (image pixel coords). The window is modelled as this
+        # rectangle plus a symmetric corner radius (self.corner_radius).
         self.sel = None  # [x, y, w, h]
-        self.contour = None
 
         # Interaction state.
         self._drag = None  # None | "move" | "new" | handle id
@@ -78,7 +78,6 @@ class ImageCanvas(Gtk.DrawingArea):
         self.pixbuf = pixbuf
         self.image_bgr = imageutils.pixbuf_to_bgr(pixbuf)
         self.sel = None
-        self.contour = None
         self.zoom = 1.0
         self._update_size()
         self.queue_draw()
@@ -195,7 +194,6 @@ class ImageCanvas(Gtk.DrawingArea):
         else:  # select mode: start drawing a new rectangle
             self._drag = "new"
             self._drag_origin = (ix, iy)
-            self.contour = None
             self.sel = [ix, iy, 0, 0]
             self.queue_draw()
         return True
@@ -231,12 +229,10 @@ class ImageCanvas(Gtk.DrawingArea):
         if self._drag == "new":
             ox, oy = self._drag_origin
             self.sel = [min(ox, ix), min(oy, iy), abs(ix - ox), abs(iy - oy)]
-            self.contour = None
         elif self._drag == "move":
             self._move_selection(ix, iy)
         else:  # resize handle
             self._resize_selection(self._drag, ix, iy)
-            self.contour = None
 
         self.queue_draw()
         return True
@@ -332,10 +328,17 @@ class ImageCanvas(Gtk.DrawingArea):
             return
         x, y, w, h = result.rect
         self.sel = [x, y, w, h]
-        self.contour = result.contour
         self.queue_draw()
-        self._emit_changed(status="Window detected — drag the handles to "
-                           "adjust, then Save or Copy.")
+        radius = result.corner_radius
+        if radius > 0:
+            status = (f"Window detected (≈{radius}px rounded corners) — drag "
+                      "the handles to adjust, then Save or Copy.")
+        else:
+            status = ("Window detected — drag the handles to adjust, then "
+                      "Save or Copy.")
+        # Seed the corner-radius control from the measurement; it remains
+        # user-editable and is the single source of truth for extraction.
+        self._emit_changed(status=status, radius=radius)
 
     # -- extraction ---------------------------------------------------------
 
@@ -346,7 +349,6 @@ class ImageCanvas(Gtk.DrawingArea):
         return detector.extract_rgba(
             self.image_bgr,
             (x, y, w, h),
-            contour=self.contour,
             corner_radius=self.corner_radius,
         )
 
@@ -402,9 +404,9 @@ class ImageCanvas(Gtk.DrawingArea):
 
     # -- signalling ---------------------------------------------------------
 
-    def _emit_changed(self, status=None):
+    def _emit_changed(self, status=None, radius=None):
         if self._on_selection_changed:
-            self._on_selection_changed(status)
+            self._on_selection_changed(status, radius)
 
 
 class MainWindow(Gtk.ApplicationWindow):
@@ -541,9 +543,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self.radius_spin = Gtk.SpinButton.new_with_range(0, 80, 1)
         self.radius_spin.set_value(0)
         self.radius_spin.set_tooltip_text(
-            "Round the corners of a manual selection so a modern window's "
-            "rounded corners become transparent. Auto-detected windows keep "
-            "their detected outline."
+            "Corner radius used when cutting out the window, so a modern "
+            "window's rounded corners become transparent. Auto-detection "
+            "measures this and fills it in for you; adjust it here if needed."
         )
         self.radius_spin.connect("value-changed", self._on_radius_changed)
         grid.attach(self.radius_spin, 1, 2, 1, 1)
@@ -720,8 +722,13 @@ class MainWindow(Gtk.ApplicationWindow):
 
     # -- helpers ------------------------------------------------------------
 
-    def _on_selection_changed(self, status=None):
+    def _on_selection_changed(self, status=None, radius=None):
         self._update_actions()
+        if radius is not None:
+            # Reflect the auto-measured corner radius in the control. Setting
+            # the spin value fires _on_radius_changed, which updates
+            # canvas.corner_radius -- the single source of truth for export.
+            self.radius_spin.set_value(radius)
         if status:
             self._set_status(status)
 

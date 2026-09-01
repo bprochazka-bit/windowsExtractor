@@ -37,6 +37,45 @@ class Detection:
     corner_radius: int = 0
 
 
+def snap_rect_to_borders(rect, img_w, img_h, tol=6):
+    """Snap any rect side lying within ``tol`` px of an image edge to the edge.
+
+    A window flush against the screen edge has no gradient there, so its
+    detected border can land a few pixels inside the image (or on the shadow),
+    leaving a thin sliver of desktop. Snapping cuts the window exactly at the
+    image boundary on that side.
+    """
+    x, y, w, h = rect
+    x2, y2 = x + w, y + h
+    if x <= tol:
+        x = 0
+    if y <= tol:
+        y = 0
+    if img_w - x2 <= tol:
+        x2 = img_w
+    if img_h - y2 <= tol:
+        y2 = img_h
+    return (x, y, x2 - x, y2 - y)
+
+
+def border_sides(rect, img_w, img_h, tol=2):
+    """Return how many of the rect's 4 sides sit on the image border.
+
+    Used as the "this looks maximized / full-screen" signal: a window touching
+    3+ image edges probably fills the screen, where edge detection cannot find
+    an outer boundary and selecting the whole image is the right answer.
+    """
+    x, y, w, h = rect
+    return sum(
+        (
+            x <= tol,
+            y <= tol,
+            img_w - (x + w) <= tol,
+            img_h - (y + h) <= tol,
+        )
+    )
+
+
 def _clamp_rect(rect, w, h):
     x, y, rw, rh = rect
     x = max(0, min(int(x), w - 1))
@@ -141,6 +180,10 @@ def detect_window_at(
 
     if best_rect is None:
         return None
+
+    # A window flush to the screen edge has no detectable border there; snap
+    # near-border sides to the exact image edge so no sliver is left behind.
+    best_rect = snap_rect_to_borders(best_rect, w, h)
 
     # Model the window as a rectangle + a single, symmetric corner radius.
     # Fill the raw contour to get the window's actual (possibly rounded) shape,

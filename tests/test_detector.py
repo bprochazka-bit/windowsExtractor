@@ -167,6 +167,59 @@ def test_detect_reports_rounded_corner_radius():
     assert abs(rw - ww) <= 12 and abs(rh - wh) <= 12
 
 
+# --- flush-to-edge behaviour ------------------------------------------------
+
+def _bg(h=800, w=1280):
+    img = np.full((h, w, 3), 50, np.uint8)
+    img[:, :, 2] = 90
+    return img
+
+
+def _draw(img, x, y, w, h):
+    cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), (235, 235, 235), -1)
+    cv2.rectangle(img, (x, y), (x + w - 1, y + 36), (200, 120, 60), -1)
+    cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), (120, 120, 120), 1)
+
+
+def test_window_flush_to_each_single_edge_is_detected():
+    H, W = 800, 1280
+    cases = {
+        "top": (300, 0, 640, 420),
+        "left": (0, 200, 640, 420),
+        "bottom": (300, 380, 640, 420),
+        "right": (640, 200, 640, 420),
+    }
+    for name, (x, y, w, h) in cases.items():
+        img = _bg(H, W)
+        _draw(img, x, y, min(x + w, W) - x, min(y + h, H) - y)
+        res = detector.detect_window_at(img, (x + w // 2, y + h // 2))
+        assert res is not None, name
+        rx, ry, rw, rh = res.rect
+        # Bounding box should span close to the true window on all sides.
+        assert abs(rx - x) <= 8 and abs(ry - y) <= 8, (name, res.rect)
+        assert abs((rx + rw) - min(x + w, W)) <= 8, (name, res.rect)
+        assert abs((ry + rh) - min(y + h, H)) <= 8, (name, res.rect)
+
+
+def test_snap_rect_to_borders():
+    # 300x200 image; a rect a few px inside each edge snaps flush.
+    assert detector.snap_rect_to_borders((3, 4, 200, 150), 300, 200) == (
+        0, 0, 203, 154
+    )
+    # Far-from-edge sides are untouched.
+    assert detector.snap_rect_to_borders((50, 60, 100, 80), 300, 200) == (
+        50, 60, 100, 80
+    )
+
+
+def test_border_sides_counts_flush_edges():
+    W, H = 1000, 800
+    assert detector.border_sides((0, 0, 1000, 800), W, H) == 4  # maximized
+    assert detector.border_sides((0, 0, 1000, 400), W, H) == 3  # docked to top
+    assert detector.border_sides((0, 100, 1000, 400), W, H) == 2  # full width
+    assert detector.border_sides((100, 100, 200, 200), W, H) == 0  # floating
+
+
 if __name__ == "__main__":
     import traceback
 

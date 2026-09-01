@@ -330,7 +330,15 @@ class ImageCanvas(Gtk.DrawingArea):
         self.sel = [x, y, w, h]
         self.queue_draw()
         radius = result.corner_radius
-        if radius > 0:
+
+        img_w, img_h = self._img_size()
+        if detector.border_sides((x, y, w, h), img_w, img_h) >= 3:
+            # Hugs 3+ image edges: almost certainly a full-screen/maximized
+            # window, whose outer border cannot be detected (it is not in the
+            # image). Point the user at the whole-image shortcut.
+            status = ("Looks like a full-screen window — its outer edge isn't "
+                      "in the screenshot. Press Ctrl+A to grab the whole image.")
+        elif radius > 0:
             status = (f"Window detected (≈{radius}px rounded corners) — drag "
                       "the handles to adjust, then Save or Copy.")
         else:
@@ -339,6 +347,16 @@ class ImageCanvas(Gtk.DrawingArea):
         # Seed the corner-radius control from the measurement; it remains
         # user-editable and is the single source of truth for extraction.
         self._emit_changed(status=status, radius=radius)
+
+    def select_whole_image(self):
+        if not self.has_image():
+            return
+        w, h = self._img_size()
+        self.sel = [0, 0, w, h]
+        self.queue_draw()
+        self._emit_changed(
+            status="Selected the whole image.", radius=0
+        )
 
     # -- extraction ---------------------------------------------------------
 
@@ -550,9 +568,19 @@ class MainWindow(Gtk.ApplicationWindow):
         self.radius_spin.connect("value-changed", self._on_radius_changed)
         grid.attach(self.radius_spin, 1, 2, 1, 1)
 
+        # Select whole image (for full-screen / maximized windows whose outer
+        # edge is not present in the screenshot).
+        whole_btn = Gtk.Button(label="Select whole image  (Ctrl+A)")
+        whole_btn.set_tooltip_text(
+            "Select the entire screenshot — use this for a maximized / "
+            "full-screen window, which has no detectable outer border."
+        )
+        whole_btn.connect("clicked", lambda _b: self.on_select_all())
+        grid.attach(whole_btn, 0, 3, 2, 1)
+
         # Zoom controls.
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        grid.attach(sep, 0, 3, 2, 1)
+        grid.attach(sep, 0, 4, 2, 1)
         zoom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         zoom_box.get_style_context().add_class("linked")
         for label, cb in (
@@ -564,14 +592,14 @@ class MainWindow(Gtk.ApplicationWindow):
             b = Gtk.Button(label=label)
             b.connect("clicked", cb)
             zoom_box.pack_start(b, True, True, 0)
-        grid.attach(zoom_box, 0, 4, 2, 1)
+        grid.attach(zoom_box, 0, 5, 2, 1)
 
         ver = Gtk.Label()
         ver.set_markup(
             f"<small>Window Extractor {__version__}</small>"
         )
         ver.set_xalign(0.0)
-        grid.attach(ver, 0, 5, 2, 1)
+        grid.attach(ver, 0, 6, 2, 1)
 
         grid.show_all()
         pop.add(grid)
@@ -585,6 +613,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("v", Gdk.ModifierType.CONTROL_MASK, self.on_paste),
             ("s", Gdk.ModifierType.CONTROL_MASK, self.on_save),
             ("c", Gdk.ModifierType.CONTROL_MASK, self.on_copy),
+            ("a", Gdk.ModifierType.CONTROL_MASK, self.on_select_all),
         ]
         for key, mods, cb in mappings:
             keyval = Gdk.keyval_from_name(key)
@@ -708,6 +737,9 @@ class MainWindow(Gtk.ApplicationWindow):
                 self._error(f"Could not save PNG:\n{exc}")
         else:
             dialog.destroy()
+
+    def on_select_all(self):
+        self.canvas.select_whole_image()
 
     def on_copy(self):
         bgra = self.canvas.extract_bgra()

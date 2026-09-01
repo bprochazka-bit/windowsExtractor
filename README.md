@@ -43,6 +43,19 @@ The measured radius pre-fills the **corner radius** control, where you can
 still adjust it. The cutout is then a clean rounded rectangle — no jagged
 contour tracing.
 
+### Windows at the image edge
+
+A window flush against **one** image edge (or a corner) is still detected: the
+edge itself has no gradient to find, but the *perpendicular* sides run to the
+image boundary and fix the bounding box. Such sides are then **snapped** exactly
+to the image edge so no thin sliver of desktop is left behind.
+
+The one case edge detection *cannot* solve is a **maximized / full-screen
+window that fills the whole screenshot** — there is no outer border anywhere in
+the image to detect. When a detection hugs 3+ image edges (the tell-tale sign),
+the status bar points you at **Select whole image (`Ctrl+A`)**, which is the
+correct result: a maximized window *is* the whole screenshot.
+
 ## Install (Debian / Ubuntu, GNOME)
 
 ```bash

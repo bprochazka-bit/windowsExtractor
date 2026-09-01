@@ -43,6 +43,29 @@ The measured radius pre-fills the **corner radius** control, where you can
 still adjust it. The cutout is then a clean rounded rectangle — no jagged
 contour tracing.
 
+### Pixel-perfect edges (no background bleed)
+
+Cutouts are meant to be dropped into other documents, so a 1px halo of the old
+desktop bleeding through is unacceptable. Three things prevent it:
+
+1. **Edge refinement.** Detection runs on a *dilated* edge map, which lands the
+   box a few pixels off. Each straight side is then keyed against its own local
+   background and moved onto the first *fully-window* pixel — so the cut never
+   sits on desktop or on an anti-aliased blend.
+2. **Corner decontamination.** A rounded corner's radius is only estimated, so
+   a crescent of desktop can survive inside the arc. Each corner is keyed
+   against the desktop colour and matching pixels are dropped — but only when
+   the corner actually exposes desktop (a square window's corner is left
+   untouched, so window content is never keyed away).
+3. **Edge cleanup.** A final erosion (default **1px**, adjustable 0–5 in the ☰
+   menu) trims the anti-aliased boundary ring on desktop-facing sides only —
+   never on a side that sits on the image boundary, where there's no background
+   to bleed and trimming would lose real content.
+
+The result composites cleanly onto any new background. If you still see a fringe
+on an unusual screenshot, raise **Edge cleanup**; to keep every last pixel of a
+window's own border, set it to 0.
+
 ### Windows at the image edge
 
 A window flush against **one** image edge (or a corner) is still detected: the

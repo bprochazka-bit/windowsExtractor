@@ -32,6 +32,9 @@ APP_ID = "com.veros.WindowExtractor"
 HANDLE = 9
 MIN_SEL = 8
 
+# Default pixels trimmed off background-adjacent edges to remove the fringe.
+DEFAULT_CLEANUP = 1
+
 # Handle identifiers: corners and edge midpoints, plus interior move / new.
 _HANDLES = ("nw", "n", "ne", "e", "se", "s", "sw", "w")
 
@@ -49,6 +52,7 @@ class ImageCanvas(Gtk.DrawingArea):
         self.mode = "detect"  # "detect" or "select"
         self.sensitivity = 0.01  # min_area_frac for detection
         self.corner_radius = 0
+        self.edge_cleanup = DEFAULT_CLEANUP  # px eroded off background edges
 
         # Selection state (image pixel coords). The window is modelled as this
         # rectangle plus a symmetric corner radius (self.corner_radius).
@@ -368,6 +372,7 @@ class ImageCanvas(Gtk.DrawingArea):
             self.image_bgr,
             (x, y, w, h),
             corner_radius=self.corner_radius,
+            edge_cleanup=self.edge_cleanup,
         )
 
     # -- drawing ------------------------------------------------------------
@@ -568,6 +573,21 @@ class MainWindow(Gtk.ApplicationWindow):
         self.radius_spin.connect("value-changed", self._on_radius_changed)
         grid.attach(self.radius_spin, 1, 2, 1, 1)
 
+        # Edge cleanup: erode the boundary to kill background bleed/fringe.
+        lbl3 = Gtk.Label(label="Edge cleanup (px)")
+        lbl3.set_xalign(0.0)
+        grid.attach(lbl3, 0, 3, 1, 1)
+        self.cleanup_spin = Gtk.SpinButton.new_with_range(0, 5, 1)
+        self.cleanup_spin.set_value(DEFAULT_CLEANUP)
+        self.cleanup_spin.set_tooltip_text(
+            "Trim this many pixels off the window's outer edge (against the "
+            "desktop only) to remove the anti-aliased fringe, so no background "
+            "color bleeds in when you paste the cutout elsewhere. Edges on the "
+            "image boundary are never trimmed. 1px suits most screenshots."
+        )
+        self.cleanup_spin.connect("value-changed", self._on_cleanup_changed)
+        grid.attach(self.cleanup_spin, 1, 3, 1, 1)
+
         # Select whole image (for full-screen / maximized windows whose outer
         # edge is not present in the screenshot).
         whole_btn = Gtk.Button(label="Select whole image  (Ctrl+A)")
@@ -576,11 +596,11 @@ class MainWindow(Gtk.ApplicationWindow):
             "full-screen window, which has no detectable outer border."
         )
         whole_btn.connect("clicked", lambda _b: self.on_select_all())
-        grid.attach(whole_btn, 0, 3, 2, 1)
+        grid.attach(whole_btn, 0, 4, 2, 1)
 
         # Zoom controls.
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        grid.attach(sep, 0, 4, 2, 1)
+        grid.attach(sep, 0, 5, 2, 1)
         zoom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         zoom_box.get_style_context().add_class("linked")
         for label, cb in (
@@ -592,14 +612,14 @@ class MainWindow(Gtk.ApplicationWindow):
             b = Gtk.Button(label=label)
             b.connect("clicked", cb)
             zoom_box.pack_start(b, True, True, 0)
-        grid.attach(zoom_box, 0, 5, 2, 1)
+        grid.attach(zoom_box, 0, 6, 2, 1)
 
         ver = Gtk.Label()
         ver.set_markup(
             f"<small>Window Extractor {__version__}</small>"
         )
         ver.set_xalign(0.0)
-        grid.attach(ver, 0, 6, 2, 1)
+        grid.attach(ver, 0, 7, 2, 1)
 
         grid.show_all()
         pop.add(grid)
@@ -639,6 +659,9 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _on_radius_changed(self, spin):
         self.canvas.corner_radius = int(spin.get_value())
+
+    def _on_cleanup_changed(self, spin):
+        self.canvas.edge_cleanup = int(spin.get_value())
 
     def _zoom_fit(self):
         alloc = self.scrolled.get_allocation()

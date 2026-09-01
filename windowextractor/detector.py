@@ -76,6 +76,107 @@ def border_sides(rect, img_w, img_h, tol=2):
     )
 
 
+def _clean_edge(band_region, bg, interior, first):
+    """Locate the boundary between background and window in ``band_region``.
+
+    ``band_region`` is oriented so the scan runs along axis 0 from OUTSIDE
+    (background) toward INSIDE (window): rows for a horizontal edge, columns
+    (transposed in) for a vertical one, with sampled lines along axis 1.
+
+    A pixel counts as window only once its colour is most of the way from the
+    local background to the window interior -- so anti-aliased blend pixels
+    (roughly halfway) are excluded and never end up opaque. Returns the median
+    boundary offset along axis 0, or ``None`` if the contrast is too low to key
+    reliably (e.g. a window edge the same colour as the desktop -- where there
+    is no visible fringe to remove anyway).
+    """
+    contrast = float(np.linalg.norm(bg - interior))
+    if contrast < 25:
+        return None
+    thresh = 0.6 * contrast
+    dist = np.linalg.norm(band_region.astype(np.float32) - bg, axis=2)
+    fg = dist >= thresh  # True where clearly window, not background/blend
+    cols_with_fg = fg.any(axis=0)
+    if not cols_with_fg.any():
+        return None
+    if first:
+        # First window pixel scanning inward from the background side.
+        idx = np.argmax(fg, axis=0)
+    else:
+        # Last window pixel (scan reversed, the window is on the outside end).
+        idx = (fg.shape[0] - 1) - np.argmax(fg[::-1], axis=0)
+    return float(np.median(idx[cols_with_fg]))
+
+
+def refine_rect_edges(image_bgr, rect, band=7, inner_frac=0.2):
+    """Move each straight side of ``rect`` onto the first uncontaminated pixel.
+
+    Detection runs on a *dilated* edge map, so the bounding box lands a few
+    pixels off and its exact position varies per side. To make the cut pixel
+    accurate (and never sitting on an anti-aliased blend of window + desktop),
+    each side is keyed against its own local background: within a small band we
+    find the transition from desktop colour to full window colour and put the
+    side on the first fully-window pixel. Sides on the image edge, and any side
+    whose contrast is too low to key, are left as they are.
+
+    Only the straight middle of each side is sampled (``inner_frac`` trims the
+    ends) so rounded corners and corner widgets do not pull an edge inward.
+    """
+    img = image_bgr[:, :, :3].astype(np.float32)
+    H, W = img.shape[:2]
+    x, y, w, h = rect
+    left, top, right, bottom = x, y, x + w - 1, y + h - 1
+
+    cx0 = min(W - 1, max(0, x + int(w * inner_frac)))
+    cx1 = min(W, max(cx0 + 1, x + int(w * (1 - inner_frac))))
+    cy0 = min(H - 1, max(0, y + int(h * inner_frac)))
+    cy1 = min(H, max(cy0 + 1, y + int(h * (1 - inner_frac))))
+
+    def med(strip):
+        return np.median(strip.reshape(-1, 3), axis=0)
+
+    # -- top --
+    if top > 0:
+        lo, hi = max(0, top - band), min(H, top + band + 1)
+        if hi - lo >= 4:
+            region = img[lo:hi, cx0:cx1]
+            off = _clean_edge(region, med(img[lo:lo + 2, cx0:cx1]),
+                              med(img[hi - 2:hi, cx0:cx1]), first=True)
+            if off is not None:
+                top = lo + int(round(off))
+    # -- bottom --
+    if bottom < H - 1:
+        lo, hi = max(0, bottom - band), min(H, bottom + band + 1)
+        if hi - lo >= 4:
+            region = img[lo:hi, cx0:cx1]
+            off = _clean_edge(region, med(img[hi - 2:hi, cx0:cx1]),
+                              med(img[lo:lo + 2, cx0:cx1]), first=False)
+            if off is not None:
+                bottom = lo + int(round(off))
+    # -- left -- (transpose so the scan runs along axis 0)
+    if left > 0:
+        lo, hi = max(0, left - band), min(W, left + band + 1)
+        if hi - lo >= 4:
+            region = np.transpose(img[cy0:cy1, lo:hi], (1, 0, 2))
+            off = _clean_edge(region, med(img[cy0:cy1, lo:lo + 2]),
+                              med(img[cy0:cy1, hi - 2:hi]), first=True)
+            if off is not None:
+                left = lo + int(round(off))
+    # -- right --
+    if right < W - 1:
+        lo, hi = max(0, right - band), min(W, right + band + 1)
+        if hi - lo >= 4:
+            region = np.transpose(img[cy0:cy1, lo:hi], (1, 0, 2))
+            off = _clean_edge(region, med(img[cy0:cy1, hi - 2:hi]),
+                              med(img[cy0:cy1, lo:lo + 2]), first=False)
+            if off is not None:
+                right = lo + int(round(off))
+
+    if right <= left or bottom <= top:
+        return rect  # refinement collapsed; keep the original
+    return (left, top, right - left + 1, bottom - top + 1)
+
+
 def _clamp_rect(rect, w, h):
     x, y, rw, rh = rect
     x = max(0, min(int(x), w - 1))
@@ -181,6 +282,12 @@ def detect_window_at(
     if best_rect is None:
         return None
 
+    # Undo the outward bias from edge-map dilation: key each straight side
+    # against its local background and move it onto the first fully-window
+    # pixel, so the rectangle is pixel accurate and never sits on a desktop
+    # or anti-aliased pixel.
+    best_rect = refine_rect_edges(image_bgr, best_rect)
+
     # A window flush to the screen edge has no detectable border there; snap
     # near-border sides to the exact image edge so no sliver is left behind.
     best_rect = snap_rect_to_borders(best_rect, w, h)
@@ -285,15 +392,114 @@ def _rounded_rect_alpha(h: int, w: int, radius: int) -> np.ndarray:
     return alpha
 
 
+def _clean_matte(alpha, at_top, at_bottom, at_left, at_right, cleanup):
+    """Erode ``alpha`` inward by ``cleanup`` px on background-adjacent sides.
+
+    Eliminates the fringe: the outermost ring of a hard cut is an anti-aliased
+    blend of window + desktop and would show the old background color when the
+    cutout is placed on a new one. Eroding just inside the boundary drops that
+    contaminated ring. Sides sitting on the image edge are NOT eroded -- there
+    is no background beyond them, so nothing to bleed and no content to lose.
+    """
+    h, w = alpha.shape[:2]
+    k = int(cleanup)
+    # Pad every side by k. Background sides are padded with 0 so erosion bites
+    # into them; image-border sides are padded with 255 so their real pixels
+    # keep no zero neighbour and survive untouched.
+    padded = np.zeros((h + 2 * k, w + 2 * k), np.uint8)
+    padded[k : k + h, k : k + w] = alpha
+    if at_top:
+        padded[:k, k : k + w] = 255
+    if at_bottom:
+        padded[k + h :, k : k + w] = 255
+    if at_left:
+        padded[k : k + h, :k] = 255
+    if at_right:
+        padded[k : k + h, k + w :] = 255
+    kernel = np.ones((2 * k + 1, 2 * k + 1), np.uint8)
+    eroded = cv2.erode(padded, kernel)
+    return eroded[k : k + h, k : k + w]
+
+
+def _median3(img, r0, r1, c0, c1):
+    r0, c0 = max(0, r0), max(0, c0)
+    r1 = min(img.shape[0], max(r0 + 1, r1))
+    c1 = min(img.shape[1], max(c0 + 1, c1))
+    return np.median(img[r0:r1, c0:c1].reshape(-1, 3), axis=0)
+
+
+def _decontaminate_corners(image_bgr, rect, alpha, radius, band=4, size=48):
+    """Remove exposed-desktop crescents left inside rounded corners.
+
+    A rounded corner's arc radius is only estimated, so the geometric mask can
+    keep a crescent of desktop opaque between the mask arc and the true window
+    arc. We key each corner against the desktop colour and drop opaque pixels
+    that match -- but ONLY when the corner actually exposes desktop.
+
+    A corner is treated as rounded (desktop-exposing) only if the crop's corner
+    pixel matches the exterior desktop just outside the rectangle there. For a
+    square window the crop corner *is* the window, does not match the exterior,
+    and is skipped -- so window content is never keyed away. Corners on the
+    image border are skipped too (no desktop beyond). The region is sized
+    generously and independently of the radius estimate, since keying only
+    removes true background.
+    """
+    img = image_bgr[:, :, :3].astype(np.float32)
+    H, W = img.shape[:2]
+    x, y, w, h = rect
+    ah, aw = alpha.shape[:2]
+    crop = img[y:y + ah, x:x + aw]
+    r = int(min(min(ah, aw) // 2, max(size, radius + band)))
+    if r <= 1:
+        return alpha
+
+    # Per corner: (alpha corner slice, crop-corner 3x3 box, interior 3x3 box,
+    # exterior sample box in full-image coords, this corner's border flags).
+    corners = [
+        ("tl", (slice(0, r), slice(0, r)), (0, 3, 0, 3), (r - 3, r, r - 3, r),
+         (y - 3, y, x - 3, x), (x <= 0 or y <= 0)),
+        ("tr", (slice(0, r), slice(aw - r, aw)), (0, 3, aw - 3, aw),
+         (r - 3, r, aw - r, aw - r + 3), (y - 3, y, x + w, x + w + 3),
+         (x + w >= W or y <= 0)),
+        ("bl", (slice(ah - r, ah), slice(0, r)), (ah - 3, ah, 0, 3),
+         (ah - r, ah - r + 3, r - 3, r), (y + h, y + h + 3, x - 3, x),
+         (x <= 0 or y + h >= H)),
+        ("br", (slice(ah - r, ah), slice(aw - r, aw)), (ah - 3, ah, aw - 3, aw),
+         (ah - r, ah - r + 3, aw - r, aw - r + 3),
+         (y + h, y + h + 3, x + w, x + w + 3), (x + w >= W or y + h >= H)),
+    ]
+    for _name, csl, cbox, ibox, ext, at_border in corners:
+        if at_border:
+            continue
+        corner_bg = _median3(crop, *cbox)
+        exterior = _median3(img, *ext)
+        # Only proceed if the crop corner really is exposed desktop.
+        if np.linalg.norm(corner_bg - exterior) > 30:
+            continue
+        interior = _median3(crop, *ibox)
+        contrast = float(np.linalg.norm(corner_bg - interior))
+        if contrast < 25:
+            continue
+        thresh = 0.6 * contrast
+        sub = crop[csl]
+        near_bg = np.linalg.norm(sub - corner_bg, axis=2) < thresh
+        a = alpha[csl]
+        a[near_bg] = 0
+        alpha[csl] = a
+    return alpha
+
+
 def extract_rgba(
     image_bgr: np.ndarray,
     rect: tuple[int, int, int, int],
     contour: Optional[np.ndarray] = None,
     corner_radius: int = 0,
+    edge_cleanup: int = 1,
 ) -> np.ndarray:
-    """Crop ``rect`` out of the image and build an RGBA cutout.
+    """Crop ``rect`` out of the image and build an clean RGBA cutout.
 
-    Everything outside the window shape is made transparent.
+    Everything outside the window shape is made transparent, and the boundary
+    is cleaned so no background color bleeds into the result.
 
     Args:
         image_bgr: source screenshot (BGR or BGRA).
@@ -302,6 +508,10 @@ def extract_rgba(
             given it takes precedence over ``corner_radius``.
         corner_radius: if > 0 and no contour is supplied, round the crop's
             corners by this many pixels (nice for modern window decorations).
+        edge_cleanup: erode the alpha inward by this many pixels on sides that
+            border the desktop, removing the anti-aliased fringe so nothing of
+            the old background shows when compositing. 0 disables it. Sides on
+            the image boundary are never eroded.
 
     Returns:
         An ``h x w x 4`` BGRA uint8 array.
@@ -319,13 +529,26 @@ def extract_rgba(
         mask = np.zeros((h, w), np.uint8)
         shifted = contour.reshape(-1, 2).astype(np.int32) - np.array([x, y])
         cv2.fillPoly(mask, [shifted], 255)
-        # Smooth the 1px jaggies from fillPoly a touch.
-        mask = cv2.GaussianBlur(mask, (3, 3), 0)
         alpha = mask
     elif corner_radius > 0:
         alpha = _rounded_rect_alpha(h, w, corner_radius)
     else:
         alpha = np.full((h, w), 255, np.uint8)
+
+    if contour is None and edge_cleanup > 0:
+        alpha = _decontaminate_corners(
+            image_bgr, (x, y, w, h), alpha, corner_radius
+        )
+
+    if edge_cleanup > 0:
+        alpha = _clean_matte(
+            alpha,
+            at_top=(y <= 0),
+            at_bottom=(y + h >= h_img),
+            at_left=(x <= 0),
+            at_right=(x + w >= w_img),
+            cleanup=edge_cleanup,
+        )
 
     bgra[:, :, 3] = alpha
     return bgra

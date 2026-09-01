@@ -1,0 +1,12 @@
+# Window Extractor runtime dependencies.
+#
+# This is a GTK3 / GNOME application. The GUI stack (PyGObject + GTK) is not
+# installable in a meaningful way from pip on Linux -- install it from the
+# system package manager. On Debian/Ubuntu (see install.sh / README.md):
+#
+#   sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
+#                    python3-opencv python3-numpy
+#
+# Only the image-processing packages below are pip-installable if you must:
+opencv-python-headless>=4.5
+numpy>=1.19

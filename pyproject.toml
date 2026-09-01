@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "windowextractor"
+version = "1.0.0"
+description = "Isolate a single application window from a screenshot with a transparent background (GTK/GNOME)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Veros" }]
+# NOTE: PyGObject/GTK (python3-gi, gir1.2-gtk-3.0) is best installed from the
+# system package manager, not pip. See README.md / install.sh.
+dependencies = [
+    "numpy>=1.19",
+    "opencv-python-headless>=4.5",
+]
+
+[project.scripts]
+window-extractor = "windowextractor.gui:main"
+
+[tool.setuptools]
+packages = ["windowextractor"]

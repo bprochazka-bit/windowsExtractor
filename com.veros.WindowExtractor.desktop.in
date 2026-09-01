@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Window Extractor
+GenericName=Screenshot Window Extractor
+Comment=Isolate a single application window from a screenshot with a transparent background
+Exec=@EXEC@ %f
+Icon=applets-screenshooter
+Terminal=false
+Categories=Graphics;Utility;GTK;
+Keywords=screenshot;window;extract;crop;transparent;isolate;png;clipboard;
+StartupNotify=true
+MimeType=image/png;image/jpeg;image/bmp;image/webp;image/tiff;

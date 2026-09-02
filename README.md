@@ -25,23 +25,41 @@ detector will accept), a **corner radius** control, and zoom controls (also
 
 ### How detection works
 
-A window is modelled as a **rectangle + a single corner radius** — the two
-things that fully describe a modern window decoration:
+A window is modelled as a **rectangle + a single corner radius**:
 
-1. **Rectangle.** Edge detection (dual-threshold Canny → dilate/close →
-   contours) yields candidate boxes; the largest one containing your click,
-   below a full-image guard, is taken as the window's width/height. Robust,
-   because a window's straight edges are its strongest lines.
-2. **Corner radius.** From each of the four corners we walk inward along the
-   45° diagonal until we cross into window pixels. For a quarter-circle of
-   radius `r`, the arc meets that diagonal at a per-axis offset of
-   `r·(1 − 1/√2)`, so each corner gives `r ≈ 3.414 × offset`. The four
-   estimates are reduced with a **median** (so one corner spoiled by a shadow
-   or a widget can't skew it) and applied **symmetrically** to all corners.
+1. **Rectangle.** Two detectors run and the better result is chosen: a
+   **long-straight-line** finder (robust on busy/photographic wallpapers, which
+   have almost no long axis-aligned lines) and a **contour** finder (best on
+   plain desktops). The result must have its sides backed by real edges — if it
+   doesn't, detection reports *nothing found* rather than grabbing a phantom
+   region, and you switch to **Select** mode.
+2. **Corner radius.** From each corner we walk inward along the 45° diagonal,
+   keyed against the desktop colour, until we reach window pixels. For a
+   quarter-circle of radius `r`, the arc meets that diagonal at a per-axis
+   offset of `r·(1 − 1/√2)`, so each corner gives `r ≈ 3.414 × offset`. The four
+   are reduced with a **median** and applied **symmetrically**.
 
-The measured radius pre-fills the **corner radius** control, where you can
-still adjust it. The cutout is then a clean rounded rectangle — no jagged
-contour tracing.
+**Limitations & the reliable fallback.** Auto-detection is a heuristic. It does
+well on windows with clear borders, but a **dark-mode window on a busy photo
+wallpaper** (low-contrast borders, overlapping windows) can defeat it — it will
+say *no window found*. When that happens, use **Select** mode: drag a rectangle
+and fine-tune with the handles. The selection then goes through the exact same
+**pixel-perfect edge cleanup** as an auto-detected one, so a hand-drawn cut is
+just as clean.
+
+### Diagnosing / tuning detection on your own screenshot
+
+To see exactly what the detector does on a specific screenshot (and get an
+overlay image you can eyeball):
+
+```bash
+python3 -m windowextractor.diagnose /path/to/shot.png X Y
+# X Y = the pixel you would click inside the window (omit for image centre)
+```
+
+It prints the line-based, contour-based, and final rectangles and writes
+`shot.detect.png` with them drawn on (green = final, amber = line, blue =
+contour, red cross = your click).
 
 ### Pixel-perfect edges (no background bleed)
 

@@ -186,6 +186,201 @@ def _clamp_rect(rect, w, h):
     return (x, y, rw, rh)
 
 
+def _merge_collinear(lines, coord_tol=6, gap=25):
+    """Merge line segments that lie on the same row/column into one.
+
+    Each entry is ``(coord, a0, a1)`` -- the perpendicular position and the
+    span. Hough returns a long window border as several pieces; merging them
+    lets a broken border read as the single long line it really is.
+    """
+    merged = []
+    for coord, a0, a1 in sorted(lines):
+        for m in merged:
+            if abs(m[0] - coord) <= coord_tol and not (a1 < m[1] - gap or a0 > m[2] + gap):
+                m[0] = (m[0] + coord) / 2.0
+                m[1] = min(m[1], a0)
+                m[2] = max(m[2], a1)
+                break
+        else:
+            merged.append([float(coord), float(a0), float(a1)])
+    return merged
+
+
+def _side_support(edges, orient, coord, lo, hi, tol=2):
+    """Fraction of positions along a segment that have an edge pixel.
+
+    Tolerates gaps: a soft or partly-occluded border still scores high as long
+    as edge pixels appear along most of its length (within +/-``tol``).
+    """
+    H, W = edges.shape[:2]
+    coord = int(coord)
+    if hi - lo < 2:
+        return 0.0
+    if orient == "h":
+        r0, r1 = max(0, coord - tol), min(H, coord + tol + 1)
+        seg = edges[r0:r1, max(0, lo):min(W, hi)]
+        present = seg.any(axis=0)
+    else:
+        c0, c1 = max(0, coord - tol), min(W, coord + tol + 1)
+        seg = edges[max(0, lo):min(H, hi), c0:c1]
+        present = seg.any(axis=1)
+    return float(present.mean()) if present.size else 0.0
+
+
+def _detect_by_lines(gray, point, min_len_frac=0.08, align_tol=12,
+                     min_support=0.32):
+    """Find the window as the largest rectangle of long, axis-aligned edges.
+
+    Photographic desktops (a wallpaper photo, a busy background) defeat
+    contour-closure detection: they generate dense edges but almost no long
+    straight lines. A window, by contrast, is a big axis-aligned rectangle of
+    them. We collect candidate horizontal/vertical border positions from long
+    Hough segments (after local contrast equalisation, so dark-mode borders on a
+    dark background still register), then score every rectangle around the click
+    by how much of each of its four sides is actually backed by edge pixels.
+    Verifying by edge *support* rather than one continuous segment tolerates
+    soft or broken borders; internal panels form smaller rectangles and lose to
+    the window's outer border.
+    """
+    H, W = gray.shape[:2]
+    px, py = point
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    eq = clahe.apply(gray)
+    edges = cv2.Canny(eq, 30, 100)
+    # A little horizontal/vertical closing so a dashed border reads continuous.
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+    min_len = max(30, int(min(H, W) * min_len_frac))
+    segs = cv2.HoughLinesP(
+        edges, 1, np.pi / 180, threshold=40,
+        minLineLength=min_len, maxLineGap=20,
+    )
+    if segs is None:
+        return None
+
+    h_coords, v_coords = [], []
+    for seg in segs.reshape(-1, 4):
+        x1, y1, x2, y2 = (int(v) for v in seg)
+        if abs(y1 - y2) <= 3 and abs(x1 - x2) >= min_len:
+            h_coords.append((y1 + y2) // 2)
+        elif abs(x1 - x2) <= 3 and abs(y1 - y2) >= min_len:
+            v_coords.append((x1 + x2) // 2)
+    # Deduplicate near-equal coordinates.
+    def dedup(vals, tol=6):
+        out = []
+        for v in sorted(vals):
+            if not out or v - out[-1] > tol:
+                out.append(v)
+            else:
+                out[-1] = (out[-1] + v) // 2
+        return out
+    h_coords, v_coords = dedup(h_coords), dedup(v_coords)
+
+    tops = [c for c in h_coords if c <= py]
+    bots = [c for c in h_coords if c >= py]
+    lefts = [c for c in v_coords if c <= px]
+    rights = [c for c in v_coords if c >= px]
+    if not (tops and bots and lefts and rights):
+        return None
+
+    # A single non-maximized window rarely spans most of the screen; capping the
+    # candidate size stops spurious rectangles that stitch together borders from
+    # several different windows. (Truly maximized windows use "Select whole
+    # image" instead.)
+    max_w, max_h = 0.8 * W, 0.8 * H
+
+    best, best_area = None, 0
+    for T in tops:
+        for B in bots:
+            if B - T < 60 or B - T > max_h:
+                continue
+            for L in lefts:
+                for R in rights:
+                    if R - L < 60 or R - L > max_w:
+                        continue
+                    area = (R - L) * (B - T)
+                    if area <= best_area:
+                        continue  # can't beat current best; skip the checks
+                    if _side_support(edges, "h", T, L, R) < min_support:
+                        continue
+                    if _side_support(edges, "h", B, L, R) < min_support:
+                        continue
+                    if _side_support(edges, "v", L, T, B) < min_support:
+                        continue
+                    if _side_support(edges, "v", R, T, B) < min_support:
+                        continue
+                    best_area = area
+                    best = (int(L), int(T), int(R - L + 1), int(B - T + 1))
+    return best
+
+
+def _detect_by_contours(gray, point, min_area, max_area):
+    """Fallback detector: largest bounded contour containing the click.
+
+    Works when the background is fairly plain (a solid-colour desktop), where a
+    window's outline closes into a clean contour.
+    """
+    px, py = point
+    h, w = gray.shape[:2]
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blur, 30, 90)
+    edges = cv2.bitwise_or(edges, cv2.Canny(blur, 60, 160))
+    kernel = np.ones((3, 3), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=2)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    best_rect, best_score = None, None
+    for c in contours:
+        x, y, rw, rh = cv2.boundingRect(c)
+        area = float(rw * rh)
+        if area < min_area or area > max_area:
+            continue
+        if not (x <= px <= x + rw and y <= py <= y + rh):
+            continue
+        aspect = rw / float(rh) if rh else 999
+        if aspect > 12 or aspect < 1 / 12:
+            continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        score = area * (1.06 if 4 <= len(approx) <= 8 else 1.0)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_rect = _clamp_rect((x, y, rw, rh), w, h)
+    return best_rect
+
+
+def _area(r):
+    return r[2] * r[3] if r else 0
+
+
+def _contains(outer, inner, tol=10):
+    ox, oy, ow, oh = outer
+    ix, iy, iw, ih = inner
+    return (ox <= ix + tol and oy <= iy + tol
+            and ox + ow >= ix + iw - tol and oy + oh >= iy + ih - tol)
+
+
+def _choose_rect(rect_l, rect_c):
+    """Combine the line- and contour-based candidates.
+
+    The line detector is the reliable one on busy/photographic backgrounds; the
+    contour detector is better at capturing a whole window (title bar included)
+    on plain backgrounds. When they describe the same window (one nested in the
+    other) and are within a modest size ratio, take the larger -- so a title bar
+    the line detector split off is recovered. When the contour result is much
+    bigger (a background blob) or the two disagree, trust the line result.
+    """
+    if rect_l is None:
+        return rect_c
+    if rect_c is None:
+        return rect_l
+    big, small = (rect_c, rect_l) if _area(rect_c) >= _area(rect_l) else (rect_l, rect_c)
+    if _contains(big, small) and _area(big) <= 2.0 * _area(small):
+        return big
+    return rect_l
+
+
 def detect_window_at(
     image_bgr: np.ndarray,
     point: tuple[int, int],
@@ -194,16 +389,19 @@ def detect_window_at(
 ) -> Optional[Detection]:
     """Detect the application window containing ``point``.
 
+    Strategy: first look for the window as the largest rectangle of long,
+    axis-aligned edges (robust on busy/photographic desktops). If that finds
+    nothing, fall back to contour-closure detection (good on plain desktops).
+    The chosen rectangle is then edge-refined, border-snapped, and given a
+    color-measured corner radius.
+
     Args:
         image_bgr: screenshot as an OpenCV BGR (or BGRA) image.
         point: (x, y) click location in image pixel coordinates.
-        min_area_frac: ignore candidate regions smaller than this fraction of
-            the whole image. Raising it makes detection prefer larger windows
-            (and ignore panels/widgets); lowering it lets it grab smaller
-            regions. Exposed as a "sensitivity" slider in the GUI.
-        max_area_frac: ignore candidate regions larger than this fraction of
-            the image, so a border tracing the entire screenshot does not win
-            over the actual window.
+        min_area_frac: for the contour fallback, ignore regions smaller than
+            this fraction of the image (the GUI "sensitivity" slider).
+        max_area_frac: for the contour fallback, ignore regions larger than
+            this fraction of the image.
 
     Returns:
         A :class:`Detection`, or ``None`` if nothing suitable was found.
@@ -222,89 +420,108 @@ def detect_window_at(
         gray = image_bgr.copy()
 
     total = float(w * h)
-    min_area = min_area_frac * total
-    max_area = max_area_frac * total
-
-    # Build an edge map. Two passes of Canny with different thresholds are
-    # merged so we catch both crisp borders and softer shadow edges. The edges
-    # are dilated and closed so a window outline forms one continuous contour
-    # even where the border is broken by rounded corners or anti-aliasing.
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges = cv2.Canny(blur, 30, 90)
-    edges2 = cv2.Canny(blur, 60, 160)
-    edges = cv2.bitwise_or(edges, edges2)
-    kernel = np.ones((3, 3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=2)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    contours, _ = cv2.findContours(
-        edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+    rect_l = _detect_by_lines(gray, (px, py))
+    rect_c = _detect_by_contours(
+        gray, (px, py), min_area_frac * total, max_area_frac * total
     )
-
-    best_rect = None
-    best_contour = None
-    best_score = None
-
-    for c in contours:
-        x, y, rw, rh = cv2.boundingRect(c)
-        rect_area = float(rw * rh)
-        if rect_area < min_area or rect_area > max_area:
-            continue
-        # Must contain the clicked point (inside the bounding box).
-        if not (x <= px <= x + rw and y <= py <= y + rh):
-            continue
-        # Skip long thin slivers (toolbars, scrollbars, separators): a window
-        # has a sensible aspect ratio.
-        aspect = rw / float(rh) if rh else 999
-        if aspect > 12 or aspect < 1 / 12:
-            continue
-
-        # Approximate the contour only to score "rectangle-likeness"; the raw
-        # contour is what we keep, because approxPolyDP collapses a rounded
-        # corner into a sharp vertex and would destroy the radius information.
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-
-        # Prefer the LARGEST qualifying region containing the click. A window
-        # is the outermost box the user is pointing at -- picking the smallest
-        # would grab an interior panel or the region below the title bar, and
-        # the max-area guard already keeps us from grabbing the whole desktop.
-        # A near-rectangular outline gets a small bonus so a clean window
-        # border wins over a ragged content blob of similar size.
-        rectangular_bonus = 1.06 if 4 <= len(approx) <= 8 else 1.0
-        score = rect_area * rectangular_bonus
-
-        if best_score is None or score > best_score:
-            best_score = score
-            best_rect = _clamp_rect((x, y, rw, rh), w, h)
-            best_contour = c
-
-    if best_rect is None:
+    rect = _choose_rect(rect_l, rect_c)
+    if rect is None:
         return None
 
-    # Undo the outward bias from edge-map dilation: key each straight side
-    # against its local background and move it onto the first fully-window
-    # pixel, so the rectangle is pixel accurate and never sits on a desktop
-    # or anti-aliased pixel.
-    best_rect = refine_rect_edges(image_bgr, best_rect)
+    # Key each straight side against its local background and move it onto the
+    # first fully-window pixel, so the rectangle is pixel accurate.
+    rect = refine_rect_edges(image_bgr, rect)
+    # A window flush to the screen edge has no detectable border there; snap.
+    rect = snap_rect_to_borders(rect, w, h)
 
-    # A window flush to the screen edge has no detectable border there; snap
-    # near-border sides to the exact image edge so no sliver is left behind.
-    best_rect = snap_rect_to_borders(best_rect, w, h)
+    # Reject a phantom rectangle whose sides are not actually backed by edges
+    # (a blob the contour detector stitched out of a busy background). Better to
+    # return nothing and let the user drag a selection than to grab the wrong
+    # region confidently. Sides on the image border are exempt.
+    if not _rect_edges_supported(gray, rect):
+        return None
 
-    # Model the window as a rectangle + a single, symmetric corner radius.
-    # Fill the raw contour to get the window's actual (possibly rounded) shape,
-    # then measure the radius off that mask.
-    region = np.zeros((h, w), np.uint8)
-    cv2.drawContours(region, [best_contour], -1, 255, thickness=cv2.FILLED)
-    radius = estimate_corner_radius(region, best_rect)
+    # Model the corners as one symmetric radius, measured against the desktop.
+    radius = _estimate_radius_color(image_bgr, rect)
 
-    return Detection(rect=best_rect, corner_radius=radius)
+    return Detection(rect=rect, corner_radius=radius)
+
+
+def _rect_edges_supported(gray, rect, min_support=0.30):
+    """True if each non-border side of ``rect`` lies on real edge pixels."""
+    H, W = gray.shape[:2]
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    edges = cv2.Canny(clahe.apply(gray), 30, 100)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    x, y, w, h = rect
+    L, T, R, B = x, y, x + w - 1, y + h - 1
+    checks = []
+    if T > 2:
+        checks.append(_side_support(edges, "h", T, L, R))
+    if B < H - 3:
+        checks.append(_side_support(edges, "h", B, L, R))
+    if L > 2:
+        checks.append(_side_support(edges, "v", L, T, B))
+    if R < W - 3:
+        checks.append(_side_support(edges, "v", R, T, B))
+    return all(c >= min_support for c in checks) if checks else True
 
 
 # The arc of a quarter circle of radius r inscribed in a right-angle corner
 # meets the 45-degree diagonal at a per-axis offset of r * (1 - 1/sqrt(2)).
 _DIAG_OFFSET = 1.0 - 1.0 / np.sqrt(2.0)  # ~= 0.2929
+
+
+def _estimate_radius_color(image_bgr, rect, max_radius=None):
+    """Estimate the corner radius by keying each corner against the desktop.
+
+    Walk inward along each corner's diagonal until the pixel stops matching the
+    exterior desktop colour; that distance implies the radius (same geometry as
+    :func:`estimate_corner_radius`). This needs no contour, so it works with the
+    line-based detector. A square corner reads as 0 (its corner pixel is already
+    window, not desktop); an occluded or low-contrast corner is skipped and the
+    median of the rest is used.
+    """
+    img = image_bgr[:, :, :3].astype(np.float32)
+    H, W = img.shape[:2]
+    x, y, w, h = rect
+    if max_radius is None:
+        max_radius = int(min(min(w, h) // 4, 80))
+    if max_radius <= 0:
+        return 0
+
+    corners = [
+        ((x, y), (1, 1), (y - 3, y, x - 3, x)),
+        ((x + w - 1, y), (-1, 1), (y - 3, y, x + w, x + w + 3)),
+        ((x, y + h - 1), (1, -1), (y + h, y + h + 3, x - 3, x)),
+        ((x + w - 1, y + h - 1), (-1, -1), (y + h, y + h + 3, x + w, x + w + 3)),
+    ]
+    ests = []
+    for (cx, cy), (dx, dy), ext in corners:
+        if cx <= 0 or cy <= 0 or cx >= W - 1 or cy >= H - 1:
+            continue  # corner on the image border: no desktop to key against
+        bg = _median3(img, *ext)
+        deep = _median3(
+            img, cy + dy * max_radius - 1, cy + dy * max_radius + 2,
+            cx + dx * max_radius - 1, cx + dx * max_radius + 2,
+        )
+        contrast = float(np.linalg.norm(bg - deep))
+        if contrast < 25:
+            continue  # occluded, or window edge same colour as desktop
+        thresh = max(30.0, 0.5 * contrast)
+        hit = 0
+        for a in range(0, max_radius + 3):
+            sx, sy = cx + dx * a, cy + dy * a
+            if not (0 <= sx < W and 0 <= sy < H):
+                break
+            if np.linalg.norm(img[sy, sx] - bg) >= thresh:
+                hit = a
+                break
+        ests.append(hit / _DIAG_OFFSET)
+    if not ests:
+        return 0
+    r = int(round(float(np.median(ests))))
+    return 0 if r < 3 else min(r, max_radius)
 
 
 def estimate_corner_radius(

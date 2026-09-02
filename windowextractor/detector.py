@@ -240,44 +240,50 @@ def _color_contrast(imgf, orient, coord, lo, hi, gap=3):
     return float(diff.mean()) / 255.0
 
 
-def snap_selection_to_edges(image_bgr, rect, search=40):
+def snap_selection_to_edges(image_bgr, rect, search=70, min_step=0.12):
     """Snap each side of a hand-drawn selection onto the nearest window border.
 
-    For each side, scan a band of +/-``search`` px and move the side to the
-    position with the strongest "boundaryness" -- edge support plus colour step
-    -- so a rough drag lands on the real window edges. Combining both cues makes
-    it work for crisp light-mode frames (edges) and faint dark-mode borders
-    (colour). A side only moves if it finds a clearly better line than where the
-    user put it, so a deliberate placement is respected. The two passes let each
-    side use the others' refined extent.
-    """
-    gray = cv2.cvtColor(image_bgr[:, :, :3], cv2.COLOR_BGR2GRAY)
-    imgf = image_bgr[:, :, :3].astype(np.float32)
-    H, W = gray.shape[:2]
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    edges = cv2.Canny(clahe.apply(gray), 30, 100)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    For each side we scan a band of +/-``search`` px and move the side to the
+    strongest window boundary. The primary cue is the COLOUR STEP across the
+    line (window vs. desktop / another window), which -- unlike edge density --
+    stays low over textured wallpaper (a forest photo fires edges everywhere but
+    has no consistent tonal step along a straight line) and peaks sharply at the
+    real border, so even a faint dark-mode edge is found. Edge support only
+    nudges ties, helping crisp light-mode frames whose colour step is small.
 
+    A mild proximity bias prefers the boundary nearest where the user drew (they
+    draw around the window, so the nearest step inward is its true edge, not an
+    internal divider). A side moves only when a real step is found that beats
+    where the user put it, so a deliberate/tight placement is respected.
+    """
+    imgf = image_bgr[:, :, :3].astype(np.float32)
+    H, W = imgf.shape[:2]
+
+    # ``min_step`` is the minimum colour step (0..1) a candidate border must
+    # show. It sits above textured-wallpaper peaks (~0.06-0.10) yet below a
+    # genuine window/desktop transition (~0.15-0.2), so the snap ignores forest
+    # noise and locks onto real edges.
     x, y, w, h = rect
     L, T, R, B = x, y, x + w - 1, y + h - 1
 
-    def score(orient, coord, lo, hi):
-        return (_side_support(edges, orient, coord, lo, hi)
-                + 1.5 * _color_contrast(imgf, orient, coord, lo, hi))
-
     def best(orient, coord, lo, hi, limit):
-        # Prefer the strongest boundary NEAR where the user drew, not the
-        # strongest anywhere in the band: a distance penalty keeps snap from
-        # jumping past the true (possibly faint) window edge onto a stronger
-        # internal divider deeper inside.
-        base = score(orient, coord, lo, hi)
+        # Snap to the NEAREST real colour step to where the user drew, not the
+        # strongest one -- people draw around a window, so its true edge is the
+        # closest step, while a stronger internal divider (title-bar line, pane
+        # split) sits deeper inside and must not steal the snap.
         lo_c, hi_c = max(0, coord - search), min(limit, coord + search + 1)
-        best_c, best_s = coord, base + 0.06  # require a clear improvement
-        for c in range(lo_c, hi_c):
-            s = score(orient, c, lo, hi) - 0.6 * abs(c - coord) / search
-            if s > best_s:
-                best_s, best_c = s, c
-        return best_c
+        cc = np.array([_color_contrast(imgf, orient, c, lo, hi)
+                       for c in range(lo_c, hi_c)])
+        if cc.size < 3:
+            return coord
+        # Local maxima above the step threshold are candidate borders.
+        peaks = []
+        for i in range(1, len(cc) - 1):
+            if cc[i] >= min_step and cc[i] >= cc[i - 1] and cc[i] >= cc[i + 1]:
+                peaks.append(lo_c + i)
+        if not peaks:
+            return coord
+        return min(peaks, key=lambda c: abs(c - coord))
 
     for _ in range(2):
         T = best("h", T, L, R, H)

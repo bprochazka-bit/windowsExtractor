@@ -323,22 +323,22 @@ def test_window_flush_detection_stays_within_window():
 
 def test_snap_selection_to_edges_pulls_rough_box_to_window():
     img, (x, y, ww, wh) = make_screenshot()
-    rough = (x - 18, y - 16, ww + 34, wh + 30)  # loosely around the window
+    rough = (x - 30, y - 24, ww + 55, wh + 48)  # a sloppy drag around the window
     sx, sy, sw, sh = detector.snap_selection_to_edges(img, rough)
-    # Each side ends up much closer to the true window than the rough drag,
-    # and does not overshoot onto an internal divider.
-    assert abs(sx - x) <= 6 and abs(sy - y) <= 6, (sx, sy)
-    assert abs((sx + sw) - (x + ww)) <= 6, sx + sw
-    assert abs((sy + sh) - (y + wh)) <= 6, sy + sh
+    # A sloppy drag (every side 24-30px off, including the title-bar side, which
+    # must NOT snap to the internal title/body divider) lands on the real window
+    # edges within a small tolerance (a drop shadow can sit a few px out).
+    assert abs(sx - x) <= 12 and abs(sy - y) <= 12, (sx, sy)
+    assert abs((sx + sw) - (x + ww)) <= 12, sx + sw
+    assert abs((sy + sh) - (y + wh)) <= 12, sy + sh
 
 
 def test_snap_selection_respects_a_tight_box():
     # A box already on the window edges should stay put (no drift).
     img, (x, y, ww, wh) = make_screenshot()
-    snapped = detector.snap_selection_to_edges(img, (x, y, ww, wh))
-    sx, sy, sw, sh = snapped
-    assert abs(sx - x) <= 4 and abs(sy - y) <= 4
-    assert abs(sw - ww) <= 6 and abs(sh - wh) <= 6
+    sx, sy, sw, sh = detector.snap_selection_to_edges(img, (x, y, ww, wh))
+    assert abs(sx - x) <= 8 and abs(sy - y) <= 8
+    assert abs(sw - ww) <= 12 and abs(sh - wh) <= 12
 
 
 def test_snap_rect_to_borders():

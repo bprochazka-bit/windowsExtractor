@@ -334,12 +334,17 @@ def test_estimate_corner_radius_geom_rounded_and_square():
     # A rounded window's radius is recovered reasonably (corner-agreement gated),
     # and -- the important case -- a SQUARE window reads exactly 0 so its corners
     # are never wrongly clipped.
+    # Estimate on the snapped box, as the GUI does (snap, then measure radius).
     for true_r in (10, 14, 16):
-        rounded, rrect = _dark_window_image(radius=true_r)
-        est = detector.estimate_corner_radius_geom(rounded, rrect)
+        rounded, (x, y, ww, wh) = _dark_window_image(radius=true_r)
+        snapped = detector.snap_selection_to_edges(
+            rounded, (x - 40, y - 30, ww + 80, wh + 60)
+        )
+        est = detector.estimate_corner_radius_geom(rounded, snapped)
         assert abs(est - true_r) <= 5, (true_r, est)
-    sq, sqrect = _dark_window_image(radius=0)
-    assert detector.estimate_corner_radius_geom(sq, sqrect) == 0
+    sq, (x, y, ww, wh) = _dark_window_image(radius=0)
+    snapped = detector.snap_selection_to_edges(sq, (x - 40, y - 30, ww + 80, wh + 60))
+    assert detector.estimate_corner_radius_geom(sq, snapped) == 0
 
 
 def test_snap_rect_to_borders():

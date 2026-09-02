@@ -266,6 +266,11 @@ def snap_selection_to_edges(image_bgr, rect, search=90, min_span=0.5):
     border only covers part of the measured extent -- the border is still the
     most complete line present. Two passes let the tightened perpendicular
     extents sharpen each border's span.
+
+    A window border is a few pixels wide (the edge gradient spans them), all
+    with near-maximal span. Among that tied cluster we take the INNERMOST column
+    -- the window side of the border -- so the geometry sits just inside the true
+    edge and no ring of background pixels leaks into the cutout.
     """
     gray = cv2.cvtColor(image_bgr[:, :, :3], cv2.COLOR_BGR2GRAY)
     H, W = gray.shape[:2]
@@ -274,7 +279,7 @@ def snap_selection_to_edges(image_bgr, rect, search=90, min_span=0.5):
     x, y, w, h = rect
     L, T, R, B = x, y, x + w - 1, y + h - 1
 
-    def best(orient, coord, lo, hi, limit):
+    def best(orient, coord, lo, hi, limit, inward):
         ridge = rv if orient == "v" else rh
         lo_c, hi_c = max(1, coord - search), min(limit - 1, coord + search + 1)
         spans = [(c, _line_span(ridge, orient, c, lo, hi))
@@ -282,66 +287,91 @@ def snap_selection_to_edges(image_bgr, rect, search=90, min_span=0.5):
         max_s = max((s for _c, s in spans), default=0.0)
         if max_s < min_span:
             return coord  # no line worth snapping to
-        near = [c for c, s in spans if s >= max_s - 0.05]
-        return min(near, key=lambda c: abs(c - coord))
+        cand = [c for c, s in spans if s >= max_s - 0.05]
+        # Group the tied columns into contiguous clusters, keep the one nearest
+        # the drawn line (the border the user meant, not another window's), and
+        # return its innermost pixel so the cut lands just inside the border.
+        clusters = [[cand[0]]]
+        for c in cand[1:]:
+            (clusters[-1].append(c) if c - clusters[-1][-1] <= 2
+             else clusters.append([c]))
+        cl = min(clusters, key=lambda g: min(abs(c - coord) for c in g))
+        return max(cl) if inward > 0 else min(cl)
 
     # Search from the ORIGINAL drawn line; two passes let each border use the
-    # others' tightened extent (which sharpens its span toward 1.0).
+    # others' tightened extent (which sharpens its span toward 1.0). ``inward``
+    # is +1 for the top/left sides (window centre is at larger coords) and -1
+    # for bottom/right.
     L0, T0, R0, B0 = L, T, R, B
     for _ in range(2):
-        T = best("h", T0, L, R, H)
-        B = best("h", B0, L, R, H)
-        L = best("v", L0, T, B, W)
-        R = best("v", R0, T, B, W)
+        T = best("h", T0, L, R, H, +1)
+        B = best("h", B0, L, R, H, -1)
+        L = best("v", L0, T, B, W, +1)
+        R = best("v", R0, T, B, W, -1)
     if R <= L or B <= T:
         return rect
     return (int(L), int(T), int(R - L + 1), int(B - T + 1))
 
 
-def estimate_corner_radius_geom(image_bgr, rect, floor=8, max_radius=40):
-    """Estimate the corner radius from where the straight edges meet the arcs.
+_NOOK_FRACTION = 1.0 - np.pi / 4.0  # area of the corner nook = r^2 * this
 
-    Given the four straight borders, each one runs across the middle of its side
-    but is ABSENT in the corner arcs (there the boundary curves away from the
-    straight line). The distance from a corner vertex to where the straight edge
-    begins is the arc's inset -- the corner radius. We measure that gap at all
-    eight edge-ends and take the median. (Returns 0 for square corners, and can
-    read low over a textured background whose noise fills the arc region -- the
-    live preview lets the user adjust.)
+
+def estimate_corner_radius_geom(image_bgr, rect, max_radius=40):
+    """Estimate the corner radius by measuring the background 'nook' area.
+
+    A rounded corner leaves a small nook of background inside the geometry's
+    square corner -- the region between the square vertex and the arc. For a
+    quarter circle of radius r that nook has area ``r^2 * (1 - pi/4)``, so
+    counting the background pixels in each corner square gives
+    ``r = sqrt(nook / (1 - pi/4))``. Background vs. window is decided per corner
+    by whichever of the exterior colour (just outside the vertex) or the interior
+    colour (deep inside) each pixel is closer to; corners on the image border, or
+    where interior and exterior are too similar to tell apart, are skipped. The
+    four estimates are reduced with a median.
+
+    This is reliable when the corner nook is a fairly uniform background (e.g. a
+    window on a plain/dark desktop). Over a busy textured wallpaper the nook is
+    not uniform and the estimate degrades -- the live preview + slider let the
+    user set it exactly.
     """
-    gray = cv2.cvtColor(image_bgr[:, :, :3], cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(image_bgr[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.float32)
     H, W = gray.shape[:2]
-    rv, rh = _edge_ridges(gray, floor)
     x, y, w, h = _clamp_rect(rect, W, H)
     L, T, R, B = x, y, x + w - 1, y + h - 1
-    cap = int(min(max_radius, min(w, h) // 3))
-
-    def inset_v(c, lo, hi, frm):
-        c = int(np.clip(c, 1, W - 2))
-        col = rv[max(0, lo):min(H, hi), c - 1:c + 2].any(axis=1)
-        idx = np.where(col)[0]
-        if idx.size == 0:
-            return 0
-        return int(idx[0]) if frm == "lo" else int(len(col) - 1 - idx[-1])
-
-    def inset_h(r, lo, hi, frm):
-        r = int(np.clip(r, 1, H - 2))
-        row = rh[r - 1:r + 2, max(0, lo):min(W, hi)].any(axis=0)
-        idx = np.where(row)[0]
-        if idx.size == 0:
-            return 0
-        return int(idx[0]) if frm == "lo" else int(len(row) - 1 - idx[-1])
-
-    insets = [
-        inset_v(L, T, B, "lo"), inset_v(L, T, B, "hi"),
-        inset_v(R, T, B, "lo"), inset_v(R, T, B, "hi"),
-        inset_h(T, L, R, "lo"), inset_h(T, L, R, "hi"),
-        inset_h(B, L, R, "lo"), inset_h(B, L, R, "hi"),
-    ]
-    r = int(np.median(insets))
-    if r < 3:
+    m = int(min(max_radius, min(w, h) // 3))
+    if m < 3:
         return 0
-    return min(r, cap)
+
+    def sample(r, c):
+        return float(gray[max(0, min(H - 1, r)), max(0, min(W - 1, c))])
+
+    # (vertex row, vertex col, row-inward sign, col-inward sign, on-border?)
+    corners = [
+        (T, L, +1, +1, T <= 0 or L <= 0),
+        (T, R, +1, -1, T <= 0 or R >= W - 1),
+        (B, L, -1, +1, B >= H - 1 or L <= 0),
+        (B, R, -1, -1, B >= H - 1 or R >= W - 1),
+    ]
+    ests = []
+    for ry, rx, sy, sx, at_border in corners:
+        if at_border:
+            continue
+        y0, y1 = (ry, ry + m) if sy > 0 else (ry - m + 1, ry + 1)
+        x0, x1 = (rx, rx + m) if sx > 0 else (rx - m + 1, rx + 1)
+        sq = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
+        if sq.size == 0:
+            continue
+        bg = sample(ry - 2 * sy, rx - 2 * sx)          # just outside the vertex
+        win = sample(ry + sy * (m - 2), rx + sx * (m - 2))  # deep inside
+        if abs(bg - win) < 12:
+            continue  # can't tell background from window here
+        nook = int((np.abs(sq - bg) < np.abs(sq - win)).sum())
+        ests.append(np.sqrt(nook / _NOOK_FRACTION) if nook > 0 else 0.0)
+
+    if not ests:
+        return 0
+    r = int(round(float(np.median(ests))))
+    return 0 if r < 3 else min(r, m)
 
 
 def _side_support(edges, orient, coord, lo, hi, tol=2):

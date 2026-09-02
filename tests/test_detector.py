@@ -330,15 +330,16 @@ def test_snap_is_stable_across_sloppy_boxes():
         assert abs(sw - ww) <= 8 and abs(sh - wh) <= 8, (sw, sh)
 
 
-def test_estimate_corner_radius_geom_distinguishes_rounded_from_square():
-    # Radius is an approximate seed (the live preview lets the user fine-tune),
-    # so we only require it to be a plausible non-zero value for a rounded
-    # window and ~0 for a square one.
-    rounded, rrect = _dark_window_image(radius=16)
-    est = detector.estimate_corner_radius_geom(rounded, rrect)
-    assert 4 <= est <= 30, est
+def test_estimate_corner_radius_geom_rounded_and_square():
+    # A rounded window's radius is recovered reasonably (corner-agreement gated),
+    # and -- the important case -- a SQUARE window reads exactly 0 so its corners
+    # are never wrongly clipped.
+    for true_r in (10, 14, 16):
+        rounded, rrect = _dark_window_image(radius=true_r)
+        est = detector.estimate_corner_radius_geom(rounded, rrect)
+        assert abs(est - true_r) <= 5, (true_r, est)
     sq, sqrect = _dark_window_image(radius=0)
-    assert detector.estimate_corner_radius_geom(sq, sqrect) <= 4
+    assert detector.estimate_corner_radius_geom(sq, sqrect) == 0
 
 
 def test_snap_rect_to_borders():

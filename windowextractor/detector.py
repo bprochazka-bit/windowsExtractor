@@ -313,64 +313,52 @@ def snap_selection_to_edges(image_bgr, rect, search=90, min_span=0.5):
     return (int(L), int(T), int(R - L + 1), int(B - T + 1))
 
 
-_NOOK_FRACTION = 1.0 - np.pi / 4.0  # area of the corner nook = r^2 * this
+def estimate_corner_radius_geom(image_bgr, rect, max_radius=40, floor=10):
+    """Estimate the corner radius, biased hard toward 0 for square windows.
 
-
-def estimate_corner_radius_geom(image_bgr, rect, max_radius=40):
-    """Estimate the corner radius by measuring the background 'nook' area.
-
-    A rounded corner leaves a small nook of background inside the geometry's
-    square corner -- the region between the square vertex and the arc. For a
-    quarter circle of radius r that nook has area ``r^2 * (1 - pi/4)``, so
-    counting the background pixels in each corner square gives
-    ``r = sqrt(nook / (1 - pi/4))``. Background vs. window is decided per corner
-    by whichever of the exterior colour (just outside the vertex) or the interior
-    colour (deep inside) each pixel is closer to; corners on the image border, or
-    where interior and exterior are too similar to tell apart, are skipped. The
-    four estimates are reduced with a median.
-
-    This is reliable when the corner nook is a fairly uniform background (e.g. a
-    window on a plain/dark desktop). Over a busy textured wallpaper the nook is
-    not uniform and the estimate degrades -- the live preview + slider let the
-    user set it exactly.
+    The straight borders are absent in the corner arcs: along the border column
+    (or row) the edge is missing for the first ``r`` pixels near a corner and
+    present after -- so how far in the edge first appears is a per-corner measure
+    of the arc. The KEY robustness rule is corner AGREEMENT: a genuinely rounded
+    window shows the same inset at all four corners, whereas a square window (or
+    a mis-measured one) either runs its edge to the corner or gives inconsistent
+    readings. So a radius is reported only when at least three corners agree
+    (low spread); otherwise the window is treated as SQUARE (0). This makes the
+    common, important case -- never rounding a square window and clipping its
+    content -- reliable. The agreed inset is scaled to the true radius (the arc
+    meets the border column short of the tangent) and returned as a seed the
+    live preview lets the user fine-tune.
     """
     gray = cv2.cvtColor(image_bgr[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.float32)
     H, W = gray.shape[:2]
+    gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    rv = (gx > floor) & (gx >= np.roll(gx, 1, 1)) & (gx >= np.roll(gx, -1, 1))
+    rh = (gy > floor) & (gy >= np.roll(gy, 1, 0)) & (gy >= np.roll(gy, -1, 0))
+
     x, y, w, h = _clamp_rect(rect, W, H)
     L, T, R, B = x, y, x + w - 1, y + h - 1
     m = int(min(max_radius, min(w, h) // 3))
     if m < 3:
         return 0
+    Lc, Rc = int(np.clip(L, 1, W - 2)), int(np.clip(R, 1, W - 2))
+    Tr, Br = int(np.clip(T, 1, H - 2)), int(np.clip(B, 1, H - 2))
 
-    def sample(r, c):
-        return float(gray[max(0, min(H - 1, r)), max(0, min(W - 1, c))])
+    def first_true(arr):
+        idx = np.where(arr)[0]
+        return int(idx[0]) if idx.size else m  # m == "edge runs to the corner"
 
-    # (vertex row, vertex col, row-inward sign, col-inward sign, on-border?)
+    # Per corner: median of the vertical-border inset and horizontal-border inset.
     corners = [
-        (T, L, +1, +1, T <= 0 or L <= 0),
-        (T, R, +1, -1, T <= 0 or R >= W - 1),
-        (B, L, -1, +1, B >= H - 1 or L <= 0),
-        (B, R, -1, -1, B >= H - 1 or R >= W - 1),
+        np.median([first_true(rv[T:T + m, Lc]), first_true(rh[Tr, L:L + m])]),
+        np.median([first_true(rv[T:T + m, Rc]), first_true(rh[Tr, R - m + 1:R + 1][::-1])]),
+        np.median([first_true(rv[B - m + 1:B + 1, Lc][::-1]), first_true(rh[Br, L:L + m])]),
+        np.median([first_true(rv[B - m + 1:B + 1, Rc][::-1]), first_true(rh[Br, R - m + 1:R + 1][::-1])]),
     ]
-    ests = []
-    for ry, rx, sy, sx, at_border in corners:
-        if at_border:
-            continue
-        y0, y1 = (ry, ry + m) if sy > 0 else (ry - m + 1, ry + 1)
-        x0, x1 = (rx, rx + m) if sx > 0 else (rx - m + 1, rx + 1)
-        sq = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
-        if sq.size == 0:
-            continue
-        bg = sample(ry - 2 * sy, rx - 2 * sx)          # just outside the vertex
-        win = sample(ry + sy * (m - 2), rx + sx * (m - 2))  # deep inside
-        if abs(bg - win) < 12:
-            continue  # can't tell background from window here
-        nook = int((np.abs(sq - bg) < np.abs(sq - win)).sum())
-        ests.append(np.sqrt(nook / _NOOK_FRACTION) if nook > 0 else 0.0)
-
-    if not ests:
-        return 0
-    r = int(round(float(np.median(ests))))
+    valid = [c for c in corners if c < m - 1]  # drop corners whose edge reaches in
+    if len(valid) < 3 or float(np.std(valid)) > 3.0:
+        return 0  # corners disagree (or square): do not round
+    r = int(round(float(np.median(valid)) * 2.2))  # inset -> true radius
     return 0 if r < 3 else min(r, m)
 
 

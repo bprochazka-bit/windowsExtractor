@@ -228,7 +228,7 @@ def _side_support(edges, orient, coord, lo, hi, tol=2):
 
 
 def _detect_by_lines(gray, point, min_len_frac=0.08, align_tol=12,
-                     min_support=0.32):
+                     min_support=0.5):
     """Find the window as the largest rectangle of long, axis-aligned edges.
 
     Photographic desktops (a wallpaper photo, a busy background) defeat
@@ -289,18 +289,25 @@ def _detect_by_lines(gray, point, min_len_frac=0.08, align_tol=12,
     # image" instead.)
     max_w, max_h = 0.8 * W, 0.8 * H
 
-    best, best_area = None, 0
+    # Pick the SMALLEST well-bordered rectangle enclosing the click, not the
+    # largest: on a multi-window desktop the largest supported rectangle just
+    # stitches together borders from several different windows. The smallest one
+    # whose four sides are each strongly backed by edges is the tightest real
+    # frame around the click. (It can still land on an inner pane -- window vs.
+    # pane is genuinely ambiguous from a flat screenshot -- which the user then
+    # grows with the handles.)
+    best, best_area = None, None
     for T in tops:
         for B in bots:
-            if B - T < 60 or B - T > max_h:
+            if not (60 <= B - T <= max_h):
                 continue
             for L in lefts:
                 for R in rights:
-                    if R - L < 60 or R - L > max_w:
+                    if not (60 <= R - L <= max_w):
                         continue
                     area = (R - L) * (B - T)
-                    if area <= best_area:
-                        continue  # can't beat current best; skip the checks
+                    if best_area is not None and area >= best_area:
+                        continue
                     if _side_support(edges, "h", T, L, R) < min_support:
                         continue
                     if _side_support(edges, "h", B, L, R) < min_support:
@@ -350,37 +357,6 @@ def _detect_by_contours(gray, point, min_area, max_area):
     return best_rect
 
 
-def _area(r):
-    return r[2] * r[3] if r else 0
-
-
-def _contains(outer, inner, tol=10):
-    ox, oy, ow, oh = outer
-    ix, iy, iw, ih = inner
-    return (ox <= ix + tol and oy <= iy + tol
-            and ox + ow >= ix + iw - tol and oy + oh >= iy + ih - tol)
-
-
-def _choose_rect(rect_l, rect_c):
-    """Combine the line- and contour-based candidates.
-
-    The line detector is the reliable one on busy/photographic backgrounds; the
-    contour detector is better at capturing a whole window (title bar included)
-    on plain backgrounds. When they describe the same window (one nested in the
-    other) and are within a modest size ratio, take the larger -- so a title bar
-    the line detector split off is recovered. When the contour result is much
-    bigger (a background blob) or the two disagree, trust the line result.
-    """
-    if rect_l is None:
-        return rect_c
-    if rect_c is None:
-        return rect_l
-    big, small = (rect_c, rect_l) if _area(rect_c) >= _area(rect_l) else (rect_l, rect_c)
-    if _contains(big, small) and _area(big) <= 2.0 * _area(small):
-        return big
-    return rect_l
-
-
 def detect_window_at(
     image_bgr: np.ndarray,
     point: tuple[int, int],
@@ -420,11 +396,14 @@ def detect_window_at(
         gray = image_bgr.copy()
 
     total = float(w * h)
-    rect_l = _detect_by_lines(gray, (px, py))
-    rect_c = _detect_by_contours(
-        gray, (px, py), min_area_frac * total, max_area_frac * total
-    )
-    rect = _choose_rect(rect_l, rect_c)
+    # Prefer the line detector's tightest well-bordered rectangle; fall back to
+    # the contour detector only for plain backgrounds. Never combine them into a
+    # larger rectangle -- that stitched borders across windows.
+    rect = _detect_by_lines(gray, (px, py))
+    if rect is None:
+        rect = _detect_by_contours(
+            gray, (px, py), min_area_frac * total, max_area_frac * total
+        )
     if rect is None:
         return None
 

@@ -818,10 +818,12 @@ class WindowExtractorApp(Gtk.Application):
 
     def do_activate(self):
         win = self._ensure_window()
+        win.show_all()
         win.present()
 
     def do_open(self, files, n_files, hint):
         win = self._ensure_window()
+        win.show_all()
         win.present()
         if files:
             path = files[0].get_path()

@@ -206,107 +206,142 @@ def _merge_collinear(lines, coord_tol=6, gap=25):
     return merged
 
 
-def _color_contrast(imgf, orient, coord, lo, hi, gap=3):
-    """Mean colour difference across a candidate boundary line, in 0..~1.
+def _edge_ridges(gray, floor=8):
+    """Binary maps of vertical- and horizontal-edge ridges.
 
-    Direction-agnostic: compares a thin strip on one side of ``coord`` to the
-    strip on the other. A real window border (window vs. desktop, or window vs.
-    another window) shows a consistent colour step even when it is too soft to
-    fire an edge detector.
+    ``rv[r, c]`` marks a vertical-edge ridge (a local maximum of the horizontal
+    gradient, above ``floor``) -- the kind of pixel a vertical window border is
+    made of; ``rh`` is the horizontal-edge equivalent. Working from ridge
+    *presence* (not magnitude) is what lets the geometry test below weigh a long
+    continuous line over a short high-contrast one.
     """
-    H, W = imgf.shape[:2]
+    g = gray.astype(np.float32)
+    gx = np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3))
+    gy = np.abs(cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3))
+    rv = (gx > floor) & (gx >= np.roll(gx, 1, 1)) & (gx >= np.roll(gx, -1, 1))
+    rh = (gy > floor) & (gy >= np.roll(gy, 1, 0)) & (gy >= np.roll(gy, -1, 0))
+    return rv, rh
+
+
+def _line_span(ridge, orient, coord, lo, hi, tol=1):
+    """Fraction of the ``[lo, hi]`` span covered by an edge at ``coord`` (+/-tol).
+
+    This is the geometry weight: a window border is a straight line that covers
+    ~all of its side (span ~1.0), while a button or icon edge covers only a few
+    rows/columns (span small), and textured wallpaper never lines up on one
+    row/column for its whole length (span stays moderate). So a high span
+    uniquely marks a true window border regardless of how strong shorter edges
+    are.
+    """
+    H, W = ridge.shape[:2]
     coord = int(coord)
     if hi - lo < 2:
         return 0.0
-    if orient == "h":
-        a0, a1 = max(0, coord - gap), max(1, coord)
-        b0, b1 = min(H, coord + 1), min(H, coord + 1 + gap)
-        A = imgf[a0:a1, max(0, lo):min(W, hi)]
-        B = imgf[b0:b1, max(0, lo):min(W, hi)]
+    if orient == "v":
+        c0, c1 = max(0, coord - tol), min(W, coord + tol + 1)
+        seg = ridge[max(0, lo):min(H, hi), c0:c1]
+        present = seg.any(axis=1)
     else:
-        a0, a1 = max(0, coord - gap), max(1, coord)
-        b0, b1 = min(W, coord + 1), min(W, coord + 1 + gap)
-        A = imgf[max(0, lo):min(H, hi), a0:a1]
-        B = imgf[max(0, lo):min(H, hi), b0:b1]
-    if A.size == 0 or B.size == 0:
-        return 0.0
-    axis = 0 if orient == "h" else 1
-    ma = A.mean(axis=axis)
-    mb = B.mean(axis=axis)
-    n = min(len(ma), len(mb))
-    if n == 0:
-        return 0.0
-    diff = np.abs(ma[:n].astype(np.float32) - mb[:n]).mean(axis=-1)
-    return float(diff.mean()) / 255.0
+        r0, r1 = max(0, coord - tol), min(H, coord + tol + 1)
+        seg = ridge[r0:r1, max(0, lo):min(W, hi)]
+        present = seg.any(axis=0)
+    return float(present.mean()) if present.size else 0.0
 
 
-def snap_selection_to_edges(image_bgr, rect, search=70, floor=0.05,
-                            prominence=0.45):
-    """Snap each side of a hand-drawn selection onto the nearest window border.
+def snap_selection_to_edges(image_bgr, rect, search=90, min_span=0.5):
+    """Snap each side of a hand-drawn selection onto the true window border.
 
-    For each side we scan a band of +/-``search`` px and move the side to the
-    nearest prominent window boundary. The cue is the COLOUR STEP across the line
-    (window vs. desktop / another window), which -- unlike edge density -- stays
-    low over textured wallpaper (a forest photo fires edges everywhere but has no
-    consistent tonal step along a straight line) and peaks at the real border.
+    A window border is distinguished from everything else by GEOMETRY, not
+    contrast: it is a straight line that runs the (near) full length of its side,
+    so almost every row (for a vertical side) has an edge at that exact column.
+    A button or icon edge -- however high-contrast -- covers only a few rows; a
+    textured wallpaper (a forest photo) has vertical structure but never lines up
+    on a single column for its whole length. So for each side we take the line of
+    MAXIMUM edge span (``_line_span``) in the search band -- the most complete
+    line, which is the border -- provided it clears a ``min_span`` floor, and
+    among near-maximal lines we pick the one nearest where the user drew.
 
-    The threshold is ADAPTIVE: a candidate must stand out relative to that side's
-    own contrast range (plus a small absolute ``floor``), so the same snap works
-    on a busy bright wallpaper (steps ~0.18 over ~0.03 noise) and on a flat dark
-    desktop with a soft window shadow (a modest step over near-zero noise). Among
-    prominent peaks the nearest to the drawn line wins -- people draw around the
-    window, so its edge is the closest step and an internal divider deeper inside
-    cannot steal the snap. A side with no prominent step is left where drawn.
+    Using the maximum (rather than a fixed span threshold) keeps it robust to a
+    loose drag: even when the drawn box is much wider than the window -- so the
+    border only covers part of the measured extent -- the border is still the
+    most complete line present. Two passes let the tightened perpendicular
+    extents sharpen each border's span.
     """
-    imgf = image_bgr[:, :, :3].astype(np.float32)
-    H, W = imgf.shape[:2]
+    gray = cv2.cvtColor(image_bgr[:, :, :3], cv2.COLOR_BGR2GRAY)
+    H, W = gray.shape[:2]
+    rv, rh = _edge_ridges(gray)
 
     x, y, w, h = rect
     L, T, R, B = x, y, x + w - 1, y + h - 1
 
     def best(orient, coord, lo, hi, limit):
-        # Snap to the prominent colour step NEAREST the drawn line. The
-        # threshold is ADAPTIVE (relative to this side's own contrast range,
-        # plus a small ``floor``) so it works on a busy bright wallpaper and on
-        # a flat dark desktop alike; wallpaper texture makes no consistent
-        # full-length step and stays below it. Nearest-to-the-drawn-line matches
-        # how people select -- a box roughly around the window -- and keeps both
-        # the window's stronger interior edges and any exterior clutter (a menu
-        # bar, another window) from stealing the snap.
-        lo_c, hi_c = max(0, coord - search), min(limit, coord + search + 1)
-        cc = np.array([_color_contrast(imgf, orient, c, lo, hi)
-                       for c in range(lo_c, hi_c)])
-        if cc.size < 5:
-            return coord
-        cc_max = float(cc.max())
-        if cc_max < floor:
-            return coord  # essentially uniform: no border to snap to
-        baseline = float(np.median(cc))
-        thresh = max(floor, baseline + prominence * (cc_max - baseline))
-        peaks = []
-        for i in range(2, len(cc) - 2):
-            window = cc[i - 2:i + 3]
-            if cc[i] >= thresh and cc[i] >= window.max():
-                peaks.append(lo_c + i)
-        if not peaks:
-            return coord
-        return min(peaks, key=lambda c: abs(c - coord))
+        ridge = rv if orient == "v" else rh
+        lo_c, hi_c = max(1, coord - search), min(limit - 1, coord + search + 1)
+        spans = [(c, _line_span(ridge, orient, c, lo, hi))
+                 for c in range(lo_c, hi_c)]
+        max_s = max((s for _c, s in spans), default=0.0)
+        if max_s < min_span:
+            return coord  # no line worth snapping to
+        near = [c for c, s in spans if s >= max_s - 0.05]
+        return min(near, key=lambda c: abs(c - coord))
 
-    # Always search from the ORIGINAL drawn line, never from an already-snapped
-    # position: re-centring on a snapped edge lets the band fill with the
-    # window's stronger interior edges, raising the adaptive threshold until it
-    # drops the true (weaker) border and the side drifts inward. Extents are
-    # still refined mutually below.
+    # Search from the ORIGINAL drawn line; two passes let each border use the
+    # others' tightened extent (which sharpens its span toward 1.0).
     L0, T0, R0, B0 = L, T, R, B
-    T = best("h", T0, L0, R0, H)
-    B = best("h", B0, L0, R0, H)
-    L = best("v", L0, T, B, W)
-    R = best("v", R0, T, B, W)
-    T = best("h", T0, L, R, H)
-    B = best("h", B0, L, R, H)
+    for _ in range(2):
+        T = best("h", T0, L, R, H)
+        B = best("h", B0, L, R, H)
+        L = best("v", L0, T, B, W)
+        R = best("v", R0, T, B, W)
     if R <= L or B <= T:
         return rect
     return (int(L), int(T), int(R - L + 1), int(B - T + 1))
+
+
+def estimate_corner_radius_geom(image_bgr, rect, floor=8, max_radius=40):
+    """Estimate the corner radius from where the straight edges meet the arcs.
+
+    Given the four straight borders, each one runs across the middle of its side
+    but is ABSENT in the corner arcs (there the boundary curves away from the
+    straight line). The distance from a corner vertex to where the straight edge
+    begins is the arc's inset -- the corner radius. We measure that gap at all
+    eight edge-ends and take the median. (Returns 0 for square corners, and can
+    read low over a textured background whose noise fills the arc region -- the
+    live preview lets the user adjust.)
+    """
+    gray = cv2.cvtColor(image_bgr[:, :, :3], cv2.COLOR_BGR2GRAY)
+    H, W = gray.shape[:2]
+    rv, rh = _edge_ridges(gray, floor)
+    x, y, w, h = _clamp_rect(rect, W, H)
+    L, T, R, B = x, y, x + w - 1, y + h - 1
+    cap = int(min(max_radius, min(w, h) // 3))
+
+    def inset_v(c, lo, hi, frm):
+        c = int(np.clip(c, 1, W - 2))
+        col = rv[max(0, lo):min(H, hi), c - 1:c + 2].any(axis=1)
+        idx = np.where(col)[0]
+        if idx.size == 0:
+            return 0
+        return int(idx[0]) if frm == "lo" else int(len(col) - 1 - idx[-1])
+
+    def inset_h(r, lo, hi, frm):
+        r = int(np.clip(r, 1, H - 2))
+        row = rh[r - 1:r + 2, max(0, lo):min(W, hi)].any(axis=0)
+        idx = np.where(row)[0]
+        if idx.size == 0:
+            return 0
+        return int(idx[0]) if frm == "lo" else int(len(row) - 1 - idx[-1])
+
+    insets = [
+        inset_v(L, T, B, "lo"), inset_v(L, T, B, "hi"),
+        inset_v(R, T, B, "lo"), inset_v(R, T, B, "hi"),
+        inset_h(T, L, R, "lo"), inset_h(T, L, R, "hi"),
+        inset_h(B, L, R, "lo"), inset_h(B, L, R, "hi"),
+    ]
+    r = int(np.median(insets))
+    if r < 3:
+        return 0
+    return min(r, cap)
 
 
 def _side_support(edges, orient, coord, lo, hi, tol=2):

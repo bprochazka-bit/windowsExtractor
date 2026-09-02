@@ -402,8 +402,7 @@ class ImageCanvas(Gtk.DrawingArea):
         """
         if self.sel is None or not self.has_image():
             return 0
-        r = detector._estimate_radius_color(self.image_bgr, tuple(self.sel))
-        return int(min(r, 24))
+        return detector.estimate_corner_radius_geom(self.image_bgr, tuple(self.sel))
 
     # -- drawing ------------------------------------------------------------
 

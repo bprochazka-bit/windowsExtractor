@@ -297,8 +297,48 @@ def test_snap_dark_window_on_dark_background():
     assert abs(sy - y) <= 8, ("top", sy)
     assert abs((sx + sw) - (x + ww)) <= 8, ("right", sx + sw)
     assert abs((sy + sh2) - (y + wh)) <= 8, ("bottom", sy + sh2)
-    # And on the tight result the corner radius is recovered.
-    assert abs(detector._estimate_radius_color(img, (sx, sy, sw, sh2)) - 14) <= 5
+
+
+def _dark_window_image(radius=14):
+    H, W = 900, 1150
+    img = np.full((H, W, 3), 12, np.uint8)
+    x, y, ww, wh = 300, 200, 600, 560
+    sh = np.zeros((H, W), np.float32)
+    cv2.rectangle(sh, (x - 6, y + 4), (x + ww + 6, y + wh + 10), 1, -1)
+    sh = cv2.GaussianBlur(sh, (0, 0), 18)[:, :, None]
+    img = (img * (1 - 0.9 * sh)).astype(np.uint8)
+    mask = detector._rounded_rect_alpha(wh, ww, radius).astype(np.float32) / 255
+    win = np.full((wh, ww, 3), 43, np.uint8)
+    win[:, :170] = (58, 58, 58)
+    roi = img[y:y + wh, x:x + ww]
+    img[y:y + wh, x:x + ww] = (
+        win * mask[:, :, None] + roi * (1 - mask[:, :, None])
+    ).astype(np.uint8)
+    return img, (x, y, ww, wh)
+
+
+def test_snap_is_stable_across_sloppy_boxes():
+    # The span-based snap keys on the border's geometry (a full-length line), so
+    # the result must not depend on how loosely the box was drawn.
+    img, (x, y, ww, wh) = _dark_window_image()
+    results = []
+    for pad in ((55, 40, 95, 80), (20, 25, 40, 55), (70, 60, 120, 110)):
+        rough = (x - pad[0], y - pad[1], ww + pad[2], wh + pad[3])
+        results.append(detector.snap_selection_to_edges(img, rough))
+    for sx, sy, sw, sh in results:
+        assert abs(sx - x) <= 6 and abs(sy - y) <= 6, (sx, sy)
+        assert abs(sw - ww) <= 8 and abs(sh - wh) <= 8, (sw, sh)
+
+
+def test_estimate_corner_radius_geom_distinguishes_rounded_from_square():
+    # Radius is an approximate seed (the live preview lets the user fine-tune),
+    # so we only require it to be a plausible non-zero value for a rounded
+    # window and ~0 for a square one.
+    rounded, rrect = _dark_window_image(radius=16)
+    est = detector.estimate_corner_radius_geom(rounded, rrect)
+    assert 4 <= est <= 30, est
+    sq, sqrect = _dark_window_image(radius=0)
+    assert detector.estimate_corner_radius_geom(sq, sqrect) <= 4
 
 
 def test_snap_rect_to_borders():

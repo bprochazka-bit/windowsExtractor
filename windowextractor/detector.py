@@ -240,7 +240,8 @@ def _color_contrast(imgf, orient, coord, lo, hi, gap=3):
     return float(diff.mean()) / 255.0
 
 
-def snap_selection_to_edges(image_bgr, rect, search=70, floor=0.05):
+def snap_selection_to_edges(image_bgr, rect, search=70, floor=0.05,
+                            prominence=0.45):
     """Snap each side of a hand-drawn selection onto the nearest window border.
 
     For each side we scan a band of +/-``search`` px and move the side to the
@@ -264,14 +265,14 @@ def snap_selection_to_edges(image_bgr, rect, search=70, floor=0.05):
     L, T, R, B = x, y, x + w - 1, y + h - 1
 
     def best(orient, coord, lo, hi, limit):
-        # Snap to the NEAREST prominent colour step to where the user drew.
-        # The threshold is ADAPTIVE -- set relative to this side's own contrast
-        # range -- so it works whether the background is a busy bright wallpaper
-        # (steps ~0.18 over ~0.03 noise) or a flat dark desktop with a soft
-        # window shadow (a modest step over near-zero noise). A small absolute
-        # floor stops it snapping to nothing on a truly uniform side. Picking
-        # the nearest prominent peak (people draw around the window) keeps an
-        # internal divider deeper inside from stealing the snap.
+        # Snap to the prominent colour step NEAREST the drawn line. The
+        # threshold is ADAPTIVE (relative to this side's own contrast range,
+        # plus a small ``floor``) so it works on a busy bright wallpaper and on
+        # a flat dark desktop alike; wallpaper texture makes no consistent
+        # full-length step and stays below it. Nearest-to-the-drawn-line matches
+        # how people select -- a box roughly around the window -- and keeps both
+        # the window's stronger interior edges and any exterior clutter (a menu
+        # bar, another window) from stealing the snap.
         lo_c, hi_c = max(0, coord - search), min(limit, coord + search + 1)
         cc = np.array([_color_contrast(imgf, orient, c, lo, hi)
                        for c in range(lo_c, hi_c)])
@@ -281,7 +282,7 @@ def snap_selection_to_edges(image_bgr, rect, search=70, floor=0.05):
         if cc_max < floor:
             return coord  # essentially uniform: no border to snap to
         baseline = float(np.median(cc))
-        thresh = max(floor, baseline + 0.45 * (cc_max - baseline))
+        thresh = max(floor, baseline + prominence * (cc_max - baseline))
         peaks = []
         for i in range(2, len(cc) - 2):
             window = cc[i - 2:i + 3]
@@ -291,11 +292,18 @@ def snap_selection_to_edges(image_bgr, rect, search=70, floor=0.05):
             return coord
         return min(peaks, key=lambda c: abs(c - coord))
 
-    for _ in range(2):
-        T = best("h", T, L, R, H)
-        B = best("h", B, L, R, H)
-        L = best("v", L, T, B, W)
-        R = best("v", R, T, B, W)
+    # Always search from the ORIGINAL drawn line, never from an already-snapped
+    # position: re-centring on a snapped edge lets the band fill with the
+    # window's stronger interior edges, raising the adaptive threshold until it
+    # drops the true (weaker) border and the side drifts inward. Extents are
+    # still refined mutually below.
+    L0, T0, R0, B0 = L, T, R, B
+    T = best("h", T0, L0, R0, H)
+    B = best("h", B0, L0, R0, H)
+    L = best("v", L0, T, B, W)
+    R = best("v", R0, T, B, W)
+    T = best("h", T0, L, R, H)
+    B = best("h", B0, L, R, H)
     if R <= L or B <= T:
         return rect
     return (int(L), int(T), int(R - L + 1), int(B - T + 1))

@@ -11,13 +11,22 @@ one window, or to isolate a window from a busy desktop background.
 
 1. **Open** a screenshot (`Ctrl+O`) or **paste** one from the clipboard
    (`Ctrl+V`) — e.g. take a full-screen shot with `PrintScreen`.
-2. In **Detect** mode, **click inside the window** you want. The app finds the
-   window's rectangular boundary using edge/contour detection.
-3. Fine-tune if needed: drag the 8 handles to resize, or drag the middle to
-   move. Prefer to do it by hand? Switch to **Select** mode and drag out the
-   rectangle yourself.
-4. **Save PNG** (`Ctrl+S`) or **Copy** (`Ctrl+C`). The area outside the window
-   is transparent.
+2. In **Select** mode (the default), **drag a rough box** around the window.
+   On release it **snaps to the window's real edges**. Nudge the 8 handles to
+   fine-tune, or press **Snap** (`S`) again after moving it.
+3. **Save PNG** (`Ctrl+S`) or **Copy** (`Ctrl+C`). The area outside the window
+   is transparent, with pixel-perfect edges (no background bleed).
+
+> **Why drag instead of one click?** Auto-detecting *which* window you mean from
+> a flattened screenshot is unreliable on busy or overlapping desktops (a dark
+> window on a photo wallpaper, windows stacked on windows — the information that
+> says which window is in front is simply gone once the image is flattened). A
+> quick rough drag removes that ambiguity; snapping + the pixel-perfect cleanup
+> do the precise part. A best-effort **Detect** mode (click-to-guess) is still
+> there in the toolbar, but Select is the dependable path.
+
+Turn snapping off (☰ menu) to place the box entirely by hand, and use
+**Select whole image** (`Ctrl+A`) for a maximized window.
 
 The menu (☰) has a **detection sensitivity** slider (how large a region the
 detector will accept), a **corner radius** control, and zoom controls (also

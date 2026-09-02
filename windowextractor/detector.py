@@ -206,6 +206,89 @@ def _merge_collinear(lines, coord_tol=6, gap=25):
     return merged
 
 
+def _color_contrast(imgf, orient, coord, lo, hi, gap=3):
+    """Mean colour difference across a candidate boundary line, in 0..~1.
+
+    Direction-agnostic: compares a thin strip on one side of ``coord`` to the
+    strip on the other. A real window border (window vs. desktop, or window vs.
+    another window) shows a consistent colour step even when it is too soft to
+    fire an edge detector.
+    """
+    H, W = imgf.shape[:2]
+    coord = int(coord)
+    if hi - lo < 2:
+        return 0.0
+    if orient == "h":
+        a0, a1 = max(0, coord - gap), max(1, coord)
+        b0, b1 = min(H, coord + 1), min(H, coord + 1 + gap)
+        A = imgf[a0:a1, max(0, lo):min(W, hi)]
+        B = imgf[b0:b1, max(0, lo):min(W, hi)]
+    else:
+        a0, a1 = max(0, coord - gap), max(1, coord)
+        b0, b1 = min(W, coord + 1), min(W, coord + 1 + gap)
+        A = imgf[max(0, lo):min(H, hi), a0:a1]
+        B = imgf[max(0, lo):min(H, hi), b0:b1]
+    if A.size == 0 or B.size == 0:
+        return 0.0
+    axis = 0 if orient == "h" else 1
+    ma = A.mean(axis=axis)
+    mb = B.mean(axis=axis)
+    n = min(len(ma), len(mb))
+    if n == 0:
+        return 0.0
+    diff = np.abs(ma[:n].astype(np.float32) - mb[:n]).mean(axis=-1)
+    return float(diff.mean()) / 255.0
+
+
+def snap_selection_to_edges(image_bgr, rect, search=40):
+    """Snap each side of a hand-drawn selection onto the nearest window border.
+
+    For each side, scan a band of +/-``search`` px and move the side to the
+    position with the strongest "boundaryness" -- edge support plus colour step
+    -- so a rough drag lands on the real window edges. Combining both cues makes
+    it work for crisp light-mode frames (edges) and faint dark-mode borders
+    (colour). A side only moves if it finds a clearly better line than where the
+    user put it, so a deliberate placement is respected. The two passes let each
+    side use the others' refined extent.
+    """
+    gray = cv2.cvtColor(image_bgr[:, :, :3], cv2.COLOR_BGR2GRAY)
+    imgf = image_bgr[:, :, :3].astype(np.float32)
+    H, W = gray.shape[:2]
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    edges = cv2.Canny(clahe.apply(gray), 30, 100)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+    x, y, w, h = rect
+    L, T, R, B = x, y, x + w - 1, y + h - 1
+
+    def score(orient, coord, lo, hi):
+        return (_side_support(edges, orient, coord, lo, hi)
+                + 1.5 * _color_contrast(imgf, orient, coord, lo, hi))
+
+    def best(orient, coord, lo, hi, limit):
+        # Prefer the strongest boundary NEAR where the user drew, not the
+        # strongest anywhere in the band: a distance penalty keeps snap from
+        # jumping past the true (possibly faint) window edge onto a stronger
+        # internal divider deeper inside.
+        base = score(orient, coord, lo, hi)
+        lo_c, hi_c = max(0, coord - search), min(limit, coord + search + 1)
+        best_c, best_s = coord, base + 0.06  # require a clear improvement
+        for c in range(lo_c, hi_c):
+            s = score(orient, c, lo, hi) - 0.6 * abs(c - coord) / search
+            if s > best_s:
+                best_s, best_c = s, c
+        return best_c
+
+    for _ in range(2):
+        T = best("h", T, L, R, H)
+        B = best("h", B, L, R, H)
+        L = best("v", L, T, B, W)
+        R = best("v", R, T, B, W)
+    if R <= L or B <= T:
+        return rect
+    return (int(L), int(T), int(R - L + 1), int(B - T + 1))
+
+
 def _side_support(edges, orient, coord, lo, hi, tol=2):
     """Fraction of positions along a segment that have an edge pixel.
 

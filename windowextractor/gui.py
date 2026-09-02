@@ -1,10 +1,11 @@
 """GTK3 GUI for Window Extractor.
 
 Layout: a toolbar of actions on top, and a scrollable image canvas below.
-Open or paste a screenshot, then either click inside a window (Detect mode)
-to auto-detect its boundary, or drag out a rectangle (Select mode). The
-selection can be nudged with 8 resize handles. Export the isolated window --
-with a transparent background -- to a PNG file or the clipboard.
+Open or paste a screenshot, then (Select mode, the default) drag a rough box
+around a window -- it snaps to the window's real edges -- and nudge the 8
+resize handles to fine-tune. (Detect mode is a best-effort click-to-guess that
+is unreliable on busy/overlapping desktops.) Export the isolated window -- with
+a transparent background -- to a PNG file or the clipboard.
 """
 
 from __future__ import annotations
@@ -49,10 +50,11 @@ class ImageCanvas(Gtk.DrawingArea):
         self.image_bgr = None  # source screenshot (numpy BGR)
         self.pixbuf = None  # display pixbuf (RGB)
         self.zoom = 1.0
-        self.mode = "detect"  # "detect" or "select"
+        self.mode = "select"  # "detect" or "select"
         self.sensitivity = 0.01  # min_area_frac for detection
         self.corner_radius = 0
         self.edge_cleanup = DEFAULT_CLEANUP  # px eroded off background edges
+        self.snap_enabled = True  # snap a hand-drawn box to window edges
 
         # Selection state (image pixel coords). The window is modelled as this
         # rectangle plus a symmetric corner radius (self.corner_radius).
@@ -205,7 +207,8 @@ class ImageCanvas(Gtk.DrawingArea):
     def _on_release(self, _w, event):
         if event.button != 1:
             return False
-        if self._drag == "new" and self.sel is not None:
+        was_new = self._drag == "new"
+        if was_new and self.sel is not None:
             # Discard a zero-size accidental click.
             if self.sel[2] < MIN_SEL or self.sel[3] < MIN_SEL:
                 self.sel = None
@@ -213,9 +216,26 @@ class ImageCanvas(Gtk.DrawingArea):
         self._drag_origin = None
         self._sel_at_press = None
         self._normalise_selection()
+        status = None
+        # Snap a freshly-drawn rough box onto the window's real edges.
+        if was_new and self.sel is not None and self.snap_enabled:
+            self.snap_current()
+            status = ("Snapped to edges — nudge the handles to fine-tune, then "
+                      "Save or Copy. (Toggle snap in the ☰ menu.)")
         self.queue_draw()
-        self._emit_changed()
+        self._emit_changed(status=status)
         return True
+
+    def snap_current(self):
+        """Snap the current selection onto nearby window borders."""
+        if self.sel is None or not self.has_image():
+            return
+        x, y, w, h = self.sel
+        if w < MIN_SEL or h < MIN_SEL:
+            return
+        self.sel = list(detector.snap_selection_to_edges(self.image_bgr, (x, y, w, h)))
+        self._normalise_selection()
+        self.queue_draw()
 
     def _on_motion(self, _w, event):
         if not self.has_image():
@@ -469,16 +489,33 @@ class MainWindow(Gtk.ApplicationWindow):
         mode_box.get_style_context().add_class("linked")
         self.detect_btn = Gtk.ToggleButton(label="Detect")
         self.detect_btn.set_tooltip_text(
-            "Click inside a window to auto-detect its boundary"
+            "Best-effort: click inside a window to guess its boundary, then "
+            "adjust. Unreliable on busy/overlapping desktops — prefer Select."
         )
-        self.detect_btn.set_active(True)
         self.select_btn = Gtk.ToggleButton(label="Select")
-        self.select_btn.set_tooltip_text("Drag to draw a selection by hand")
+        self.select_btn.set_tooltip_text(
+            "Drag a box around the window — it snaps to the edges. The reliable "
+            "way; fine-tune with the handles."
+        )
+        # Select is the default: assisted-manual is the dependable path.
+        self.select_btn.set_active(True)
         self.detect_btn.connect("toggled", self._on_mode_toggled, "detect")
         self.select_btn.connect("toggled", self._on_mode_toggled, "select")
         mode_box.pack_start(self.detect_btn, False, False, 0)
         mode_box.pack_start(self.select_btn, False, False, 0)
         header.pack_start(mode_box)
+
+        # Snap the current selection onto window edges, on demand.
+        self.snap_btn = Gtk.Button.new_from_icon_name(
+            "zoom-fit-best-symbolic", Gtk.IconSize.BUTTON
+        )
+        self.snap_btn.set_label("Snap")
+        self.snap_btn.set_always_show_image(True)
+        self.snap_btn.set_tooltip_text(
+            "Snap the current selection onto the window's edges (S)"
+        )
+        self.snap_btn.connect("clicked", lambda _b: self.on_snap())
+        header.pack_start(self.snap_btn)
 
         # Export actions on the right.
         self.copy_btn = Gtk.Button.new_from_icon_name(
@@ -529,7 +566,8 @@ class MainWindow(Gtk.ApplicationWindow):
         vbox.pack_start(self.statusbar, False, False, 0)
 
         self._set_status(
-            "Open or paste a screenshot to begin (Ctrl+O / Ctrl+V)."
+            "Open or paste a screenshot (Ctrl+O / Ctrl+V), then drag a box "
+            "around a window — it snaps to the edges."
         )
 
     def _build_options_popover(self):
@@ -588,6 +626,18 @@ class MainWindow(Gtk.ApplicationWindow):
         self.cleanup_spin.connect("value-changed", self._on_cleanup_changed)
         grid.attach(self.cleanup_spin, 1, 3, 1, 1)
 
+        # Snap toggle: snap a hand-drawn box onto window edges on release.
+        self.snap_check = Gtk.CheckButton(label="Snap drawn box to edges")
+        self.snap_check.set_active(True)
+        self.snap_check.set_tooltip_text(
+            "When you drag a selection in Select mode, snap its sides onto the "
+            "window's real edges. Turn off to place the box entirely by hand."
+        )
+        self.snap_check.connect(
+            "toggled", lambda b: setattr(self.canvas, "snap_enabled", b.get_active())
+        )
+        grid.attach(self.snap_check, 0, 4, 2, 1)
+
         # Select whole image (for full-screen / maximized windows whose outer
         # edge is not present in the screenshot).
         whole_btn = Gtk.Button(label="Select whole image  (Ctrl+A)")
@@ -596,11 +646,11 @@ class MainWindow(Gtk.ApplicationWindow):
             "full-screen window, which has no detectable outer border."
         )
         whole_btn.connect("clicked", lambda _b: self.on_select_all())
-        grid.attach(whole_btn, 0, 4, 2, 1)
+        grid.attach(whole_btn, 0, 5, 2, 1)
 
         # Zoom controls.
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        grid.attach(sep, 0, 5, 2, 1)
+        grid.attach(sep, 0, 6, 2, 1)
         zoom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         zoom_box.get_style_context().add_class("linked")
         for label, cb in (
@@ -612,14 +662,14 @@ class MainWindow(Gtk.ApplicationWindow):
             b = Gtk.Button(label=label)
             b.connect("clicked", cb)
             zoom_box.pack_start(b, True, True, 0)
-        grid.attach(zoom_box, 0, 6, 2, 1)
+        grid.attach(zoom_box, 0, 7, 2, 1)
 
         ver = Gtk.Label()
         ver.set_markup(
             f"<small>Window Extractor {__version__}</small>"
         )
         ver.set_xalign(0.0)
-        grid.attach(ver, 0, 7, 2, 1)
+        grid.attach(ver, 0, 8, 2, 1)
 
         grid.show_all()
         pop.add(grid)
@@ -634,6 +684,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("s", Gdk.ModifierType.CONTROL_MASK, self.on_save),
             ("c", Gdk.ModifierType.CONTROL_MASK, self.on_copy),
             ("a", Gdk.ModifierType.CONTROL_MASK, self.on_select_all),
+            ("s", 0, self.on_snap),
         ]
         for key, mods, cb in mappings:
             keyval = Gdk.keyval_from_name(key)
@@ -707,8 +758,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.canvas.set_image_from_pixbuf(pixbuf)
         GLib.idle_add(self._zoom_fit)
         self._set_status(
-            f"Loaded {os.path.basename(path)} — click inside a window "
-            "to detect it."
+            f"Loaded {os.path.basename(path)} — drag a box around a window "
+            "(it snaps to the edges), then Save or Copy."
         )
 
     def on_paste(self):
@@ -724,7 +775,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.canvas.set_image_from_pixbuf(pixbuf)
         GLib.idle_add(self._zoom_fit)
         self._set_status(
-            "Pasted screenshot — click inside a window to detect it."
+            "Pasted screenshot — drag a box around a window (it snaps to the "
+            "edges), then Save or Copy."
         )
 
     def on_save(self):
@@ -764,6 +816,14 @@ class MainWindow(Gtk.ApplicationWindow):
     def on_select_all(self):
         self.canvas.select_whole_image()
 
+    def on_snap(self):
+        if not self.canvas.has_selection():
+            self._set_status("Draw a selection first, then Snap.")
+            return
+        self.canvas.snap_current()
+        self._on_selection_changed(status="Snapped the selection to the "
+                                   "window's edges.")
+
     def on_copy(self):
         bgra = self.canvas.extract_bgra()
         if bgra is None:
@@ -791,6 +851,7 @@ class MainWindow(Gtk.ApplicationWindow):
         has_sel = self.canvas.has_selection()
         self.save_btn.set_sensitive(has_sel)
         self.copy_btn.set_sensitive(has_sel)
+        self.snap_btn.set_sensitive(has_sel)
 
     def _set_status(self, text):
         self.statusbar.set_text(text)

@@ -321,6 +321,26 @@ def test_window_flush_detection_stays_within_window():
         assert rx + rw <= xw + 8 and ry + rh <= yh + 8, (name, res.rect)
 
 
+def test_snap_selection_to_edges_pulls_rough_box_to_window():
+    img, (x, y, ww, wh) = make_screenshot()
+    rough = (x - 18, y - 16, ww + 34, wh + 30)  # loosely around the window
+    sx, sy, sw, sh = detector.snap_selection_to_edges(img, rough)
+    # Each side ends up much closer to the true window than the rough drag,
+    # and does not overshoot onto an internal divider.
+    assert abs(sx - x) <= 6 and abs(sy - y) <= 6, (sx, sy)
+    assert abs((sx + sw) - (x + ww)) <= 6, sx + sw
+    assert abs((sy + sh) - (y + wh)) <= 6, sy + sh
+
+
+def test_snap_selection_respects_a_tight_box():
+    # A box already on the window edges should stay put (no drift).
+    img, (x, y, ww, wh) = make_screenshot()
+    snapped = detector.snap_selection_to_edges(img, (x, y, ww, wh))
+    sx, sy, sw, sh = snapped
+    assert abs(sx - x) <= 4 and abs(sy - y) <= 4
+    assert abs(sw - ww) <= 6 and abs(sh - wh) <= 6
+
+
 def test_snap_rect_to_borders():
     # 300x200 image; a rect a few px inside each edge snaps flush.
     assert detector.snap_rect_to_borders((3, 4, 200, 150), 300, 200) == (

@@ -240,46 +240,52 @@ def _color_contrast(imgf, orient, coord, lo, hi, gap=3):
     return float(diff.mean()) / 255.0
 
 
-def snap_selection_to_edges(image_bgr, rect, search=55, min_step=0.16):
+def snap_selection_to_edges(image_bgr, rect, search=70, floor=0.05):
     """Snap each side of a hand-drawn selection onto the nearest window border.
 
     For each side we scan a band of +/-``search`` px and move the side to the
-    strongest window boundary. The primary cue is the COLOUR STEP across the
-    line (window vs. desktop / another window), which -- unlike edge density --
-    stays low over textured wallpaper (a forest photo fires edges everywhere but
-    has no consistent tonal step along a straight line) and peaks sharply at the
-    real border, so even a faint dark-mode edge is found. Edge support only
-    nudges ties, helping crisp light-mode frames whose colour step is small.
+    nearest prominent window boundary. The cue is the COLOUR STEP across the line
+    (window vs. desktop / another window), which -- unlike edge density -- stays
+    low over textured wallpaper (a forest photo fires edges everywhere but has no
+    consistent tonal step along a straight line) and peaks at the real border.
 
-    A mild proximity bias prefers the boundary nearest where the user drew (they
-    draw around the window, so the nearest step inward is its true edge, not an
-    internal divider). A side moves only when a real step is found that beats
-    where the user put it, so a deliberate/tight placement is respected.
+    The threshold is ADAPTIVE: a candidate must stand out relative to that side's
+    own contrast range (plus a small absolute ``floor``), so the same snap works
+    on a busy bright wallpaper (steps ~0.18 over ~0.03 noise) and on a flat dark
+    desktop with a soft window shadow (a modest step over near-zero noise). Among
+    prominent peaks the nearest to the drawn line wins -- people draw around the
+    window, so its edge is the closest step and an internal divider deeper inside
+    cannot steal the snap. A side with no prominent step is left where drawn.
     """
     imgf = image_bgr[:, :, :3].astype(np.float32)
     H, W = imgf.shape[:2]
 
-    # ``min_step`` is the minimum colour step (0..1) a candidate border must
-    # show. It sits above textured-wallpaper peaks (~0.06-0.10) yet below a
-    # genuine window/desktop transition (~0.15-0.2), so the snap ignores forest
-    # noise and locks onto real edges.
     x, y, w, h = rect
     L, T, R, B = x, y, x + w - 1, y + h - 1
 
     def best(orient, coord, lo, hi, limit):
-        # Snap to the NEAREST real colour step to where the user drew, not the
-        # strongest one -- people draw around a window, so its true edge is the
-        # closest step, while a stronger internal divider (title-bar line, pane
-        # split) sits deeper inside and must not steal the snap.
+        # Snap to the NEAREST prominent colour step to where the user drew.
+        # The threshold is ADAPTIVE -- set relative to this side's own contrast
+        # range -- so it works whether the background is a busy bright wallpaper
+        # (steps ~0.18 over ~0.03 noise) or a flat dark desktop with a soft
+        # window shadow (a modest step over near-zero noise). A small absolute
+        # floor stops it snapping to nothing on a truly uniform side. Picking
+        # the nearest prominent peak (people draw around the window) keeps an
+        # internal divider deeper inside from stealing the snap.
         lo_c, hi_c = max(0, coord - search), min(limit, coord + search + 1)
         cc = np.array([_color_contrast(imgf, orient, c, lo, hi)
                        for c in range(lo_c, hi_c)])
-        if cc.size < 3:
+        if cc.size < 5:
             return coord
-        # Local maxima above the step threshold are candidate borders.
+        cc_max = float(cc.max())
+        if cc_max < floor:
+            return coord  # essentially uniform: no border to snap to
+        baseline = float(np.median(cc))
+        thresh = max(floor, baseline + 0.45 * (cc_max - baseline))
         peaks = []
-        for i in range(1, len(cc) - 1):
-            if cc[i] >= min_step and cc[i] >= cc[i - 1] and cc[i] >= cc[i + 1]:
+        for i in range(2, len(cc) - 2):
+            window = cc[i - 2:i + 3]
+            if cc[i] >= thresh and cc[i] >= window.max():
                 peaks.append(lo_c + i)
         if not peaks:
             return coord

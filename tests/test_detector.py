@@ -270,6 +270,37 @@ def test_snap_selection_respects_a_tight_box():
     assert abs(sw - ww) <= 12 and abs(sh - wh) <= 12
 
 
+def test_snap_dark_window_on_dark_background():
+    # A dark window with a soft drop shadow on a near-black desktop (the
+    # low-contrast case where a fixed threshold fails). The adaptive threshold
+    # must still snap every side -- including a very loose left side.
+    H, W = 900, 1150
+    img = np.full((H, W, 3), 12, np.uint8)
+    x, y, ww, wh = 300, 200, 600, 560
+    sh = np.zeros((H, W), np.float32)
+    cv2.rectangle(sh, (x - 6, y + 4), (x + ww + 6, y + wh + 10), 1, -1)
+    sh = cv2.GaussianBlur(sh, (0, 0), 18)[:, :, None]
+    img = (img * (1 - 0.9 * sh)).astype(np.uint8)
+    mask = detector._rounded_rect_alpha(wh, ww, 14).astype(np.float32) / 255
+    win = np.full((wh, ww, 3), 43, np.uint8)
+    win[:, :170] = (58, 58, 58)
+    roi = img[y:y + wh, x:x + ww]
+    img[y:y + wh, x:x + ww] = (
+        win * mask[:, :, None] + roi * (1 - mask[:, :, None])
+    ).astype(np.uint8)
+
+    # Sloppy box, left side the loosest (-55px), like the reported case.
+    sx, sy, sw, sh2 = detector.snap_selection_to_edges(
+        img, (x - 55, y - 40, ww + 95, wh + 80)
+    )
+    assert abs(sx - x) <= 8, ("left", sx)
+    assert abs(sy - y) <= 8, ("top", sy)
+    assert abs((sx + sw) - (x + ww)) <= 8, ("right", sx + sw)
+    assert abs((sy + sh2) - (y + wh)) <= 8, ("bottom", sy + sh2)
+    # And on the tight result the corner radius is recovered.
+    assert abs(detector._estimate_radius_color(img, (sx, sy, sw, sh2)) - 14) <= 5
+
+
 def test_snap_rect_to_borders():
     # 300x200 image; a rect a few px inside each edge snaps flush.
     assert detector.snap_rect_to_borders((3, 4, 200, 150), 300, 200) == (

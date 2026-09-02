@@ -74,42 +74,33 @@ def test_click_outside_image_returns_none():
     assert detector.detect_window_at(img, (99999, 99999)) is None
 
 
-def test_extract_rgba_shapes_and_alpha():
+def test_extract_square_geometry_keeps_everything():
     img, (x, y, ww, wh) = make_screenshot()
-    bgra = detector.extract_rgba(img, (x, y, ww, wh), edge_cleanup=0)
+    bgra = detector.extract_rgba(img, (x, y, ww, wh))  # radius 0 => square
     assert bgra.shape == (wh, ww, 4)
-    # No contour / no radius / no cleanup => fully opaque.
+    # Square geometry: every pixel is inside, so all opaque, nothing trimmed.
     assert (bgra[:, :, 3] == 255).all()
-    # With the default 1px cleanup, the outer ring is trimmed but the interior
-    # stays opaque.
-    trimmed = detector.extract_rgba(img, (x, y, ww, wh))
-    assert (trimmed[:, 0, 3] == 0).all() and (trimmed[0, :, 3] == 0).all()
-    assert (trimmed[wh // 2, 2 : ww - 2, 3] == 255).all()
 
 
-def test_extract_rounded_corners_makes_corner_transparent():
+def test_extract_keeps_inside_pixels_untouched():
+    # The contract: colour channels inside the geometry are byte-for-byte the
+    # source pixels -- no erosion, no keying, nothing modified.
+    img, (x, y, ww, wh) = make_screenshot()
+    bgra = detector.extract_rgba(img, (x, y, ww, wh), corner_radius=20)
+    crop = img[y : y + wh, x : x + ww]
+    inside = bgra[:, :, 3] == 255
+    assert inside.any()
+    assert (bgra[:, :, :3][inside] == crop[inside]).all()
+
+
+def test_extract_rounded_corner_clears_outside_only():
     img, (x, y, ww, wh) = make_screenshot()
     bgra = detector.extract_rgba(img, (x, y, ww, wh), corner_radius=25)
-    # The very corner pixel should be transparent, the centre opaque.
+    # Corner (outside the rounded geometry) is cleared; centre kept.
     assert bgra[0, 0, 3] == 0
     assert bgra[wh // 2, ww // 2, 3] == 255
-
-
-def test_extract_with_contour_masks_outside():
-    img, (x, y, ww, wh) = make_screenshot()
-    # A diamond contour inside the crop; corners of the bbox must be cut away.
-    contour = np.array(
-        [
-            [x + ww // 2, y],
-            [x + ww, y + wh // 2],
-            [x + ww // 2, y + wh],
-            [x, y + wh // 2],
-        ],
-        dtype=np.int32,
-    ).reshape(-1, 1, 2)
-    bgra = detector.extract_rgba(img, (x, y, ww, wh), contour=contour)
-    assert bgra[2, 2, 3] == 0  # near bbox corner -> outside diamond
-    assert bgra[wh // 2, ww // 2, 3] == 255  # centre -> inside diamond
+    # A point well inside the straight top edge stays opaque (only corners cut).
+    assert bgra[2, ww // 2, 3] == 255
 
 
 def test_extract_clamps_out_of_bounds_rect():
@@ -205,80 +196,18 @@ def _max_redness_of_opaque(bgra):
     return int((r - g)[opaque].max())
 
 
-def test_no_background_bleed_after_cleanup():
-    img, _ = _aa_window_on_red()
-    res = detector.detect_window_at(img, (640, 400))
-    assert res is not None
-    # Without cleanup the anti-aliased ring keeps red-tinted pixels...
-    dirty = detector.extract_rgba(img, res.rect, corner_radius=res.corner_radius,
-                                  edge_cleanup=0)
-    # ...and the default cleanup removes them.
-    clean = detector.extract_rgba(img, res.rect, corner_radius=res.corner_radius,
-                                  edge_cleanup=1)
-    assert _max_redness_of_opaque(clean) <= 25, _max_redness_of_opaque(clean)
-    assert _max_redness_of_opaque(clean) < _max_redness_of_opaque(dirty)
-
-
-def test_no_background_bleed_rounded_window():
+def test_geometry_defines_the_cut_exactly():
+    # A rounded geometry over a window on red: pixels outside the geometry are
+    # cleared; pixels inside keep their exact source colour. Any "bleed" is
+    # purely a function of the geometry, not post-processing.
     img, _ = _aa_window_on_red(radius=22)
-    res = detector.detect_window_at(img, (640, 400))
-    assert res is not None
-    clean = detector.extract_rgba(img, res.rect, corner_radius=res.corner_radius,
-                                  edge_cleanup=2)
-    assert _max_redness_of_opaque(clean) <= 25, _max_redness_of_opaque(clean)
-
-
-def test_no_bleed_on_gradient_background_rounded():
-    # Rounded, anti-aliased window over a busy per-pixel-varying desktop.
-    H, W = 700, 1000
-    yy, xx = np.mgrid[0:H, 0:W]
-    bg = np.zeros((H, W, 3), np.float32)
-    bg[:, :, 0] = 80 + 100 * np.sin(xx / 90.0)
-    bg[:, :, 1] = 40 + xx / 8.0
-    bg[:, :, 2] = 200 - yy / 6.0
-    bg = np.clip(bg, 0, 255)
-    x, y, ww, wh, rad = 220, 150, 560, 380, 20
-    win = np.full((H, W, 3), 235.0, np.float32)
-    win[y:y + 34] = (180, 110, 55)
-    shape = detector._rounded_rect_alpha(wh, ww, rad).astype(np.float32) / 255.0
-    a = np.zeros((H, W), np.float32)
-    a[y:y + wh, x:x + ww] = shape
-    a = cv2.GaussianBlur(a, (3, 3), 0)[:, :, None]
-    img = (win * a + bg * (1 - a)).astype(np.uint8)
-
-    res = detector.detect_window_at(img, (x + ww // 2, y + wh // 2))
-    assert res is not None
-    clean = detector.extract_rgba(img, res.rect, corner_radius=res.corner_radius)
-    assert _max_redness_of_opaque(clean) <= 20, _max_redness_of_opaque(clean)
-
-
-def test_square_window_corner_not_punched():
-    # Hard-edged gray window on red: a square corner must stay solid even
-    # though corner decontamination runs -- the exterior check skips it.
-    H, W = 600, 900
-    img = np.zeros((H, W, 3), np.uint8)
-    img[:, :] = (0, 0, 255)  # red
-    x, y, ww, wh = 200, 150, 500, 350
-    img[y:y + wh, x:x + ww] = (210, 210, 210)  # gray window, hard edges
-    res = detector.detect_window_at(img, (x + ww // 2, y + wh // 2))
-    assert res is not None
-    bgra = detector.extract_rgba(img, res.rect, corner_radius=res.corner_radius)
-    # A solid block just inside the corner is fully opaque (no keyed-out hole).
-    assert (bgra[4:44, 4:44, 3] == 255).all()
-    # And no red bled in anywhere.
-    assert _max_redness_of_opaque(bgra) <= 20, _max_redness_of_opaque(bgra)
-
-
-def test_cleanup_preserves_image_border_edges():
-    # Window flush to the top edge: cleanup must NOT erode the top row (there
-    # is no desktop above it to bleed, and eroding would lose real content).
-    img, (x, y, ww, wh) = _aa_window_on_red(x=300, y=0, ww=640, wh=420)
-    bgra = detector.extract_rgba(img, (x, 0, ww, wh), edge_cleanup=2)
-    # The middle of the top row stays opaque (border side is not eroded); only
-    # the far corners are trimmed where the eroded left/right sides reach up.
-    assert (bgra[0, ww // 2 - 60 : ww // 2 + 60, 3] == 255).all()
-    # But an interior side (left) should have been trimmed to transparent.
-    assert bgra[wh // 2, 0, 3] == 0 and bgra[wh // 2, 1, 3] == 0
+    rect = (300, 200, 640, 420)
+    bgra = detector.extract_rgba(img, rect, corner_radius=22)
+    expected = detector._rounded_rect_alpha(420, 640, 22)
+    assert (bgra[:, :, 3] == expected).all()
+    crop = img[200:620, 300:940]
+    inside = bgra[:, :, 3] == 255
+    assert (bgra[:, :, :3][inside] == crop[inside]).all()
 
 
 # --- flush-to-edge behaviour ------------------------------------------------

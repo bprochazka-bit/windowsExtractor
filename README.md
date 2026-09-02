@@ -70,28 +70,20 @@ It prints the line-based, contour-based, and final rectangles and writes
 `shot.detect.png` with them drawn on (green = final, amber = line, blue =
 contour, red cross = your click).
 
-### Pixel-perfect edges (no background bleed)
+### The cutout is defined purely by the geometry
 
-Cutouts are meant to be dropped into other documents, so a 1px halo of the old
-desktop bleeding through is unacceptable. Three things prevent it:
+The cut is dead simple and predictable: once you have the **geometry**
+(the rectangle + a corner radius), every pixel **inside** the geometry is kept
+exactly as-is, and every pixel **outside** it is made transparent. No erosion,
+no colour keying, nothing else touched — so a clean result is entirely a matter
+of getting the geometry right, which the snap and the handles do.
 
-1. **Edge refinement.** Detection runs on a *dilated* edge map, which lands the
-   box a few pixels off. Each straight side is then keyed against its own local
-   background and moved onto the first *fully-window* pixel — so the cut never
-   sits on desktop or on an anti-aliased blend.
-2. **Corner decontamination.** A rounded corner's radius is only estimated, so
-   a crescent of desktop can survive inside the arc. Each corner is keyed
-   against the desktop colour and matching pixels are dropped — but only when
-   the corner actually exposes desktop (a square window's corner is left
-   untouched, so window content is never keyed away).
-3. **Edge cleanup.** A final erosion (default **1px**, adjustable 0–5 in the ☰
-   menu) trims the anti-aliased boundary ring on desktop-facing sides only —
-   never on a side that sits on the image boundary, where there's no background
-   to bleed and trimming would lose real content.
-
-The result composites cleanly onto any new background. If you still see a fringe
-on an unusual screenshot, raise **Edge cleanup**; to keep every last pixel of a
-window's own border, set it to 0.
+- The selection preview shows the **rounded geometry live** — the bright area is
+  exactly what will be kept — so you can see the corners and dial the **corner
+  radius** (☰ menu) until a rounded window's corners are cut cleanly with no
+  desktop showing. Snapping fills in a starting radius automatically.
+- If a sliver of desktop shows along an edge, the geometry is a pixel too big
+  there — nudge that handle in. If you're clipping the window, nudge it out.
 
 ### Windows at the image edge
 

@@ -10,6 +10,7 @@ a transparent background -- to a PNG file or the clipboard.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Optional
 
@@ -33,9 +34,6 @@ APP_ID = "com.veros.WindowExtractor"
 HANDLE = 9
 MIN_SEL = 8
 
-# Default pixels trimmed off background-adjacent edges to remove the fringe.
-DEFAULT_CLEANUP = 1
-
 # Handle identifiers: corners and edge midpoints, plus interior move / new.
 _HANDLES = ("nw", "n", "ne", "e", "se", "s", "sw", "w")
 
@@ -53,7 +51,6 @@ class ImageCanvas(Gtk.DrawingArea):
         self.mode = "select"  # "detect" or "select"
         self.sensitivity = 0.01  # min_area_frac for detection
         self.corner_radius = 0
-        self.edge_cleanup = DEFAULT_CLEANUP  # px eroded off background edges
         self.snap_enabled = True  # snap a hand-drawn box to window edges
 
         # Selection state (image pixel coords). The window is modelled as this
@@ -217,13 +214,17 @@ class ImageCanvas(Gtk.DrawingArea):
         self._sel_at_press = None
         self._normalise_selection()
         status = None
-        # Snap a freshly-drawn rough box onto the window's real edges.
-        if was_new and self.sel is not None and self.snap_enabled:
-            self.snap_current()
-            status = ("Snapped to edges — nudge the handles to fine-tune, then "
-                      "Save or Copy. (Toggle snap in the ☰ menu.)")
+        radius = None
+        # Snap a freshly-drawn rough box onto the window's real edges, then
+        # match the geometry's corner radius to the window automatically.
+        if was_new and self.sel is not None:
+            if self.snap_enabled:
+                self.snap_current()
+                status = ("Snapped to edges — nudge the handles to fine-tune, "
+                          "then Save or Copy. (Toggle snap in the ☰ menu.)")
+            radius = self.estimate_radius()
         self.queue_draw()
-        self._emit_changed(status=status)
+        self._emit_changed(status=status, radius=radius)
         return True
 
     def snap_current(self):
@@ -389,11 +390,20 @@ class ImageCanvas(Gtk.DrawingArea):
             return None
         x, y, w, h = self.sel
         return detector.extract_rgba(
-            self.image_bgr,
-            (x, y, w, h),
-            corner_radius=self.corner_radius,
-            edge_cleanup=self.edge_cleanup,
+            self.image_bgr, (x, y, w, h), corner_radius=self.corner_radius
         )
+
+    def estimate_radius(self):
+        """Estimate the corner radius of the current selection's window.
+
+        Clamped to a modest maximum: on a loose selection the estimate can run
+        large (it measures desktop past the true edge), and over-rounding cuts
+        into the window, so we cap it. The user can raise it in the menu.
+        """
+        if self.sel is None or not self.has_image():
+            return 0
+        r = detector._estimate_radius_color(self.image_bgr, tuple(self.sel))
+        return int(min(r, 24))
 
     # -- drawing ------------------------------------------------------------
 
@@ -419,19 +429,30 @@ class ImageCanvas(Gtk.DrawingArea):
         ww, wh = w * self.zoom, h * self.zoom
         img_w, img_h = self._img_size()
         full_w, full_h = img_w * self.zoom, img_h * self.zoom
+        r = self.corner_radius * self.zoom  # geometry radius in widget px
 
-        # Dim everything outside the selection.
-        cr.set_source_rgba(0, 0, 0, 0.45)
-        cr.rectangle(0, 0, full_w, wy)  # top
-        cr.rectangle(0, wy + wh, full_w, full_h - (wy + wh))  # bottom
-        cr.rectangle(0, wy, wx, wh)  # left
-        cr.rectangle(wx + ww, wy, full_w - (wx + ww), wh)  # right
-        cr.fill()
+        # Dim everything OUTSIDE the rounded-rectangle geometry, so what's shown
+        # bright is exactly what will be kept (corners included). Uses an
+        # even-odd fill of the viewport minus the rounded selection path.
+        if cairo is not None:
+            cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+            cr.rectangle(0, 0, full_w, full_h)
+            self._rounded_path(cr, wx, wy, ww, wh, r)
+            cr.set_source_rgba(0, 0, 0, 0.5)
+            cr.fill()
+            cr.set_fill_rule(cairo.FILL_RULE_WINDING)
+        else:  # fallback: plain rectangular dim
+            cr.set_source_rgba(0, 0, 0, 0.5)
+            cr.rectangle(0, 0, full_w, wy)
+            cr.rectangle(0, wy + wh, full_w, full_h - (wy + wh))
+            cr.rectangle(0, wy, wx, wh)
+            cr.rectangle(wx + ww, wy, full_w - (wx + ww), wh)
+            cr.fill()
 
-        # Selection border.
+        # Geometry border (rounded).
         cr.set_line_width(1.5)
         cr.set_source_rgba(0.15, 0.6, 1.0, 1.0)
-        cr.rectangle(wx + 0.5, wy + 0.5, ww, wh)
+        self._rounded_path(cr, wx + 0.5, wy + 0.5, ww, wh, r)
         cr.stroke()
 
         # Resize handles.
@@ -444,6 +465,20 @@ class ImageCanvas(Gtk.DrawingArea):
             cr.rectangle(hx + 0.5, hy + 0.5, hhw - 1, hhh - 1)
             cr.stroke()
         return False
+
+    @staticmethod
+    def _rounded_path(cr, x, y, w, h, r):
+        """Add a rounded-rectangle sub-path to the cairo context."""
+        r = max(0.0, min(r, w / 2.0, h / 2.0))
+        if r <= 0.5:
+            cr.rectangle(x, y, w, h)
+            return
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+        cr.close_path()
 
     # -- signalling ---------------------------------------------------------
 
@@ -604,27 +639,12 @@ class MainWindow(Gtk.ApplicationWindow):
         self.radius_spin = Gtk.SpinButton.new_with_range(0, 80, 1)
         self.radius_spin.set_value(0)
         self.radius_spin.set_tooltip_text(
-            "Corner radius used when cutting out the window, so a modern "
-            "window's rounded corners become transparent. Auto-detection "
-            "measures this and fills it in for you; adjust it here if needed."
+            "Corner radius of the cutout geometry, so a rounded window's corners "
+            "are cut cleanly. Measured for you when you snap a selection; adjust "
+            "here if a corner looks square or over-rounded."
         )
         self.radius_spin.connect("value-changed", self._on_radius_changed)
         grid.attach(self.radius_spin, 1, 2, 1, 1)
-
-        # Edge cleanup: erode the boundary to kill background bleed/fringe.
-        lbl3 = Gtk.Label(label="Edge cleanup (px)")
-        lbl3.set_xalign(0.0)
-        grid.attach(lbl3, 0, 3, 1, 1)
-        self.cleanup_spin = Gtk.SpinButton.new_with_range(0, 5, 1)
-        self.cleanup_spin.set_value(DEFAULT_CLEANUP)
-        self.cleanup_spin.set_tooltip_text(
-            "Trim this many pixels off the window's outer edge (against the "
-            "desktop only) to remove the anti-aliased fringe, so no background "
-            "color bleeds in when you paste the cutout elsewhere. Edges on the "
-            "image boundary are never trimmed. 1px suits most screenshots."
-        )
-        self.cleanup_spin.connect("value-changed", self._on_cleanup_changed)
-        grid.attach(self.cleanup_spin, 1, 3, 1, 1)
 
         # Snap toggle: snap a hand-drawn box onto window edges on release.
         self.snap_check = Gtk.CheckButton(label="Snap drawn box to edges")
@@ -636,7 +656,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.snap_check.connect(
             "toggled", lambda b: setattr(self.canvas, "snap_enabled", b.get_active())
         )
-        grid.attach(self.snap_check, 0, 4, 2, 1)
+        grid.attach(self.snap_check, 0, 3, 2, 1)
 
         # Select whole image (for full-screen / maximized windows whose outer
         # edge is not present in the screenshot).
@@ -646,11 +666,11 @@ class MainWindow(Gtk.ApplicationWindow):
             "full-screen window, which has no detectable outer border."
         )
         whole_btn.connect("clicked", lambda _b: self.on_select_all())
-        grid.attach(whole_btn, 0, 5, 2, 1)
+        grid.attach(whole_btn, 0, 4, 2, 1)
 
         # Zoom controls.
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        grid.attach(sep, 0, 6, 2, 1)
+        grid.attach(sep, 0, 5, 2, 1)
         zoom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         zoom_box.get_style_context().add_class("linked")
         for label, cb in (
@@ -662,14 +682,14 @@ class MainWindow(Gtk.ApplicationWindow):
             b = Gtk.Button(label=label)
             b.connect("clicked", cb)
             zoom_box.pack_start(b, True, True, 0)
-        grid.attach(zoom_box, 0, 7, 2, 1)
+        grid.attach(zoom_box, 0, 6, 2, 1)
 
         ver = Gtk.Label()
         ver.set_markup(
             f"<small>Window Extractor {__version__}</small>"
         )
         ver.set_xalign(0.0)
-        grid.attach(ver, 0, 8, 2, 1)
+        grid.attach(ver, 0, 7, 2, 1)
 
         grid.show_all()
         pop.add(grid)
@@ -710,9 +730,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _on_radius_changed(self, spin):
         self.canvas.corner_radius = int(spin.get_value())
-
-    def _on_cleanup_changed(self, spin):
-        self.canvas.edge_cleanup = int(spin.get_value())
+        self.canvas.queue_draw()  # live-update the rounded preview
 
     def _zoom_fit(self):
         alloc = self.scrolled.get_allocation()
@@ -821,8 +839,10 @@ class MainWindow(Gtk.ApplicationWindow):
             self._set_status("Draw a selection first, then Snap.")
             return
         self.canvas.snap_current()
-        self._on_selection_changed(status="Snapped the selection to the "
-                                   "window's edges.")
+        self._on_selection_changed(
+            status="Snapped the selection to the window's edges.",
+            radius=self.canvas.estimate_radius(),
+        )
 
     def on_copy(self):
         bgra = self.canvas.extract_bgra()

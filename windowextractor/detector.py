@@ -240,7 +240,7 @@ def _color_contrast(imgf, orient, coord, lo, hi, gap=3):
     return float(diff.mean()) / 255.0
 
 
-def snap_selection_to_edges(image_bgr, rect, search=70, min_step=0.12):
+def snap_selection_to_edges(image_bgr, rect, search=55, min_step=0.16):
     """Snap each side of a hand-drawn selection onto the nearest window border.
 
     For each side we scan a band of +/-``search`` px and move the side to the
@@ -662,7 +662,12 @@ def estimate_corner_radius(
 
 
 def _rounded_rect_alpha(h: int, w: int, radius: int) -> np.ndarray:
-    """Return an ``h x w`` uint8 alpha mask for a rounded rectangle."""
+    """Return an ``h x w`` uint8 alpha mask for a rounded rectangle.
+
+    255 inside the rounded-rectangle geometry, 0 outside. The rounded corners
+    are anti-aliased so the arc is smooth; the straight sides are pixel-aligned
+    hard edges.
+    """
     alpha = np.zeros((h, w), np.uint8)
     r = int(max(0, min(radius, min(h, w) // 2)))
     if r <= 0:
@@ -671,39 +676,10 @@ def _rounded_rect_alpha(h: int, w: int, radius: int) -> np.ndarray:
     # Central cross of full-opacity rectangles.
     cv2.rectangle(alpha, (r, 0), (w - r, h), 255, -1)
     cv2.rectangle(alpha, (0, r), (w, h - r), 255, -1)
-    # Four corner discs.
-    for cx, cy in ((r, r), (w - r, r), (r, h - r), (w - r, h - r)):
-        cv2.circle(alpha, (cx, cy), r, 255, -1)
+    # Four corner discs, anti-aliased for a smooth arc.
+    for cx, cy in ((r, r), (w - r - 1, r), (r, h - r - 1), (w - r - 1, h - r - 1)):
+        cv2.circle(alpha, (cx, cy), r, 255, -1, lineType=cv2.LINE_AA)
     return alpha
-
-
-def _clean_matte(alpha, at_top, at_bottom, at_left, at_right, cleanup):
-    """Erode ``alpha`` inward by ``cleanup`` px on background-adjacent sides.
-
-    Eliminates the fringe: the outermost ring of a hard cut is an anti-aliased
-    blend of window + desktop and would show the old background color when the
-    cutout is placed on a new one. Eroding just inside the boundary drops that
-    contaminated ring. Sides sitting on the image edge are NOT eroded -- there
-    is no background beyond them, so nothing to bleed and no content to lose.
-    """
-    h, w = alpha.shape[:2]
-    k = int(cleanup)
-    # Pad every side by k. Background sides are padded with 0 so erosion bites
-    # into them; image-border sides are padded with 255 so their real pixels
-    # keep no zero neighbour and survive untouched.
-    padded = np.zeros((h + 2 * k, w + 2 * k), np.uint8)
-    padded[k : k + h, k : k + w] = alpha
-    if at_top:
-        padded[:k, k : k + w] = 255
-    if at_bottom:
-        padded[k + h :, k : k + w] = 255
-    if at_left:
-        padded[k : k + h, :k] = 255
-    if at_right:
-        padded[k : k + h, k + w :] = 255
-    kernel = np.ones((2 * k + 1, 2 * k + 1), np.uint8)
-    eroded = cv2.erode(padded, kernel)
-    return eroded[k : k + h, k : k + w]
 
 
 def _median3(img, r0, r1, c0, c1):
@@ -713,90 +689,24 @@ def _median3(img, r0, r1, c0, c1):
     return np.median(img[r0:r1, c0:c1].reshape(-1, 3), axis=0)
 
 
-def _decontaminate_corners(image_bgr, rect, alpha, radius, band=4, size=48):
-    """Remove exposed-desktop crescents left inside rounded corners.
-
-    A rounded corner's arc radius is only estimated, so the geometric mask can
-    keep a crescent of desktop opaque between the mask arc and the true window
-    arc. We key each corner against the desktop colour and drop opaque pixels
-    that match -- but ONLY when the corner actually exposes desktop.
-
-    A corner is treated as rounded (desktop-exposing) only if the crop's corner
-    pixel matches the exterior desktop just outside the rectangle there. For a
-    square window the crop corner *is* the window, does not match the exterior,
-    and is skipped -- so window content is never keyed away. Corners on the
-    image border are skipped too (no desktop beyond). The region is sized
-    generously and independently of the radius estimate, since keying only
-    removes true background.
-    """
-    img = image_bgr[:, :, :3].astype(np.float32)
-    H, W = img.shape[:2]
-    x, y, w, h = rect
-    ah, aw = alpha.shape[:2]
-    crop = img[y:y + ah, x:x + aw]
-    r = int(min(min(ah, aw) // 2, max(size, radius + band)))
-    if r <= 1:
-        return alpha
-
-    # Per corner: (alpha corner slice, crop-corner 3x3 box, interior 3x3 box,
-    # exterior sample box in full-image coords, this corner's border flags).
-    corners = [
-        ("tl", (slice(0, r), slice(0, r)), (0, 3, 0, 3), (r - 3, r, r - 3, r),
-         (y - 3, y, x - 3, x), (x <= 0 or y <= 0)),
-        ("tr", (slice(0, r), slice(aw - r, aw)), (0, 3, aw - 3, aw),
-         (r - 3, r, aw - r, aw - r + 3), (y - 3, y, x + w, x + w + 3),
-         (x + w >= W or y <= 0)),
-        ("bl", (slice(ah - r, ah), slice(0, r)), (ah - 3, ah, 0, 3),
-         (ah - r, ah - r + 3, r - 3, r), (y + h, y + h + 3, x - 3, x),
-         (x <= 0 or y + h >= H)),
-        ("br", (slice(ah - r, ah), slice(aw - r, aw)), (ah - 3, ah, aw - 3, aw),
-         (ah - r, ah - r + 3, aw - r, aw - r + 3),
-         (y + h, y + h + 3, x + w, x + w + 3), (x + w >= W or y + h >= H)),
-    ]
-    for _name, csl, cbox, ibox, ext, at_border in corners:
-        if at_border:
-            continue
-        corner_bg = _median3(crop, *cbox)
-        exterior = _median3(img, *ext)
-        # Only proceed if the crop corner really is exposed desktop.
-        if np.linalg.norm(corner_bg - exterior) > 30:
-            continue
-        interior = _median3(crop, *ibox)
-        contrast = float(np.linalg.norm(corner_bg - interior))
-        if contrast < 25:
-            continue
-        thresh = 0.6 * contrast
-        sub = crop[csl]
-        near_bg = np.linalg.norm(sub - corner_bg, axis=2) < thresh
-        a = alpha[csl]
-        a[near_bg] = 0
-        alpha[csl] = a
-    return alpha
-
-
 def extract_rgba(
     image_bgr: np.ndarray,
     rect: tuple[int, int, int, int],
-    contour: Optional[np.ndarray] = None,
     corner_radius: int = 0,
-    edge_cleanup: int = 1,
 ) -> np.ndarray:
-    """Crop ``rect`` out of the image and build an clean RGBA cutout.
+    """Crop ``rect`` out of the image and cut it to the window geometry.
 
-    Everything outside the window shape is made transparent, and the boundary
-    is cleaned so no background color bleeds into the result.
+    The geometry is the rectangle plus an optional symmetric ``corner_radius``.
+    Every pixel INSIDE the geometry is kept exactly as-is; every pixel OUTSIDE
+    it is made fully transparent. Nothing else is touched -- no erosion, no
+    colour keying -- so getting a clean cutout is purely a matter of getting the
+    geometry right (which the snap + handles do). The rounded corners are
+    anti-aliased for a smooth arc.
 
     Args:
         image_bgr: source screenshot (BGR or BGRA).
-        rect: (x, y, w, h) region to extract.
-        contour: optional outline (image coords) used as the alpha mask; when
-            given it takes precedence over ``corner_radius``.
-        corner_radius: if > 0 and no contour is supplied, round the crop's
-            corners by this many pixels (nice for modern window decorations).
-        edge_cleanup: erode the alpha inward by this many pixels on sides that
-            border the desktop, removing the anti-aliased fringe so nothing of
-            the old background shows when compositing. 0 disables it. Sides on
-            the image boundary are never eroded.
+        rect: (x, y, w, h) geometry rectangle in image pixels.
+        corner_radius: corner radius of the geometry (0 = square corners).
 
     Returns:
         An ``h x w x 4`` BGRA uint8 array.
@@ -810,30 +720,6 @@ def extract_rgba(
     else:
         bgra = cv2.cvtColor(crop[:, :, :3], cv2.COLOR_BGR2BGRA)
 
-    if contour is not None:
-        mask = np.zeros((h, w), np.uint8)
-        shifted = contour.reshape(-1, 2).astype(np.int32) - np.array([x, y])
-        cv2.fillPoly(mask, [shifted], 255)
-        alpha = mask
-    elif corner_radius > 0:
-        alpha = _rounded_rect_alpha(h, w, corner_radius)
-    else:
-        alpha = np.full((h, w), 255, np.uint8)
-
-    if contour is None and edge_cleanup > 0:
-        alpha = _decontaminate_corners(
-            image_bgr, (x, y, w, h), alpha, corner_radius
-        )
-
-    if edge_cleanup > 0:
-        alpha = _clean_matte(
-            alpha,
-            at_top=(y <= 0),
-            at_bottom=(y + h >= h_img),
-            at_left=(x <= 0),
-            at_right=(x + w >= w_img),
-            cleanup=edge_cleanup,
-        )
-
-    bgra[:, :, 3] = alpha
+    # Alpha = the geometry: 255 inside, 0 outside. Colour channels untouched.
+    bgra[:, :, 3] = _rounded_rect_alpha(h, w, corner_radius)
     return bgra
